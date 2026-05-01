@@ -1,162 +1,144 @@
-# Pulse v2 — Public Sentiment Index
+# Pulse v3 — Multi-Source Public Sentiment Index
 
-Real Reddit data, real classifier, real numbers. The honest version of v1.
+Four sources triangulating. Disagreement is itself a signal.
 
-## What this actually does
+## What's new vs v2
 
-1. Authenticates with **Reddit's official OAuth API** (60 req/min, no scraping)
-2. Searches country-relevant subreddits for the topic, fetches **actual posts and top comments** with timestamps and upvote counts
-3. Runs each comment through **`cardiffnlp/twitter-xlm-roberta-base-sentiment`** — a multilingual sentiment classifier (HuggingFace Inference API)
-4. Aggregates with a **defined upvote-weighted formula** and computes a **bootstrap confidence interval** (500 resamples)
-5. Has Claude synthesize themes — but **only over the same comments that were measured**, not from its training data
-6. Returns real sample size, real source links, real timestamps
+v2 was honest about its measurements — but it was still one source. If Reddit was telling you a weird story, you had no way to know. v3 fixes that.
 
-No fabricated stats. Every number traces back to a real comment. Every comment has a permalink you can click.
+| | v2 | v3 |
+|---|---|---|
+| Sources | 1 (Reddit) | 4 (Reddit + GDELT + Wikipedia + Polymarket) |
+| Sentiment blend | n/a | Weighted by sample size, with bootstrap CI |
+| Cross-source disagreement | hidden | **surfaced as "divergence" — a story signal** |
+| Attention/momentum | n/a | Wikipedia 30-day pageview chart |
+| Conviction signal | n/a | Polymarket "money on the line" prob |
+| News tone, country-filtered | n/a | GDELT 2.0 DOC API, ~50–500 articles per query |
+| Architecture | Sequential pipeline | Promise.allSettled in parallel — 4 sources fetched at once |
+
+## What each source actually contributes
+
+- **Reddit** → grassroots conversation. What ordinary online people say to each other, classified by a multilingual sentiment model.
+- **GDELT** → institutional voice. What the press in your country is saying, weighted by tone score.
+- **Wikipedia** → attention curve. Are people *looking up* this topic? Surging or fading? (This isn't sentiment — it's whether anyone cares.)
+- **Polymarket** → conviction. When real money is betting on an event related to the topic, what probability does it imply?
+
+Reddit and GDELT are blended into the headline Pulse Index. Wikipedia and Polymarket are surfaced separately because mixing "event probability" with "comment sentiment" is the same vibes-math we built v2 to escape.
+
+## The signature feature: divergence
+
+When Reddit and GDELT disagree by 15+ points, the result page surfaces a **divergence panel** with a written story. Examples of what this catches:
+
+- *"News media is markedly more positive (72) than Reddit conversation (54). Often signals an institutional/grassroots gap."*
+- *"Reddit is markedly more positive (78) than news coverage (51). Often signals an enthusiast bubble or a story media hasn't caught up to."*
+
+This is the part you can't get from any single source.
 
 ## What you need
 
-Three credentials. All free to get.
+Three credentials. All free. (Wikipedia, GDELT, Polymarket need none — they're fully public.)
 
-### 1. Reddit OAuth credentials (5 min)
+### 1. Reddit OAuth (5 min) — same as v2
+1. https://www.reddit.com/prefs/apps → "create another app" → "script"
+2. Copy `client_id` and `client_secret`
 
-1. Go to https://www.reddit.com/prefs/apps
-2. Scroll to bottom → **"create another app..."**
-3. Choose **"script"** type
-4. Fill in:
-   - name: `pulse-sentiment` (anything)
-   - description: leave blank
-   - about url: leave blank
-   - redirect uri: `http://localhost:8080` (placeholder, unused for client_credentials)
-5. Click **"create app"**
-6. Copy:
-   - `client_id` — the random string under your app name (under "personal use script")
-   - `client_secret` — labeled "secret"
+### 2. Hugging Face token (2 min) — same as v2
+1. https://huggingface.co/settings/tokens → "New token" → role: "Read"
 
-### 2. Hugging Face token (2 min)
-
-1. Sign up / log in at https://huggingface.co
-2. Go to https://huggingface.co/settings/tokens
-3. **"New token"** → role: **Read** → name: anything → create
-4. Copy the token (starts with `hf_`)
-
-Free tier rate limits are generous for testing. For production traffic, look at HF Inference Providers' paid tier.
-
-### 3. Anthropic API key (2 min)
-
-1. Sign up at https://console.anthropic.com/
-2. Generate an API key
-3. Note: this is used for theme synthesis over the measured corpus — about 1 short call per query
+### 3. Anthropic API key (2 min) — same as v2
+1. https://console.anthropic.com/
 
 ## Setup
 
 ```bash
-# 1. Install
 npm install
-
-# 2. Copy env template
 cp .env.local.example .env.local
-
-# 3. Fill in your credentials in .env.local
-# REDDIT_CLIENT_ID=...
-# REDDIT_CLIENT_SECRET=...
-# REDDIT_USERNAME=your_reddit_username
-# REDDIT_USER_AGENT=pulse-sentiment/1.0 by /u/your_reddit_username
-# HF_TOKEN=hf_...
-# ANTHROPIC_API_KEY=sk-ant-...
-
-# 4. Run
+# fill in REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT,
+#         HF_TOKEN, ANTHROPIC_API_KEY
 npm run dev
 ```
 
-Open `http://localhost:3000`.
-
-First query takes 30–60 seconds (HF model cold-start). Subsequent queries are 20–40 seconds.
-
-## Deploying to Vercel
-
-```bash
-npm install -g vercel
-vercel
-```
-
-Then add the env vars in the Vercel dashboard: **Project → Settings → Environment Variables**. Set the same five vars from `.env.local`.
-
-**Important — timeout:**
-- **Vercel Hobby** caps serverless functions at 60s. Most queries fit. Some won't.
-- **Vercel Pro** ($20/mo) raises it to 300s. Recommended.
-
-The `/app/api/analyze/route.ts` already declares `export const maxDuration = 60` — bump to `300` if on Pro.
+Open `http://localhost:3000`. First query: 30–60s (HF cold-start). Subsequent: 25–45s.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Frontend (app/page.tsx)                                │
-│  - Country picker + topic input                         │
-│  - Loading ritual (rotating status)                     │
-│  - Reveal w/ counter + CI + breakdown + voices + themes │
-│  - SVG share card → PNG download                        │
-└────────────────────────┬────────────────────────────────┘
-                         │ POST /api/analyze
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│  app/api/analyze/route.ts (orchestrator)                │
-│                                                         │
-│  1. lib/reddit.ts                                       │
-│     ├─ getToken()         OAuth client_credentials      │
-│     ├─ searchSubreddit()  /r/{sub}/search.json          │
-│     └─ fetchPostComments() /r/{sub}/comments/{id}.json  │
-│     → ~200-300 comments across ~10-16 threads           │
-│                                                         │
-│  2. lib/sentiment.ts                                    │
-│     └─ classifyAll()     HF: cardiffnlp xlm-roberta     │
-│     → 3-class probabilities per comment                 │
-│                                                         │
-│  3. lib/aggregate.ts                                    │
-│     ├─ weight = log(2 + max(0, upvotes))                │
-│     ├─ signed = P(pos) - P(neg)                         │
-│     ├─ pulse  = round(50 * (1 + Σw·s / Σw))             │
-│     └─ bootstrap() 500 resamples → p25/p75 CI           │
-│                                                         │
-│  4. lib/themes.ts                                       │
-│     └─ Claude synthesizes themes OVER the measured      │
-│        corpus (not its training data)                   │
-└─────────────────────────────────────────────────────────┘
+       User submits country + topic
+              │
+              ▼
+    /api/analyze  (orchestrator)
+              │
+              ▼
+   ┌──────────┴──────────┐  Promise.allSettled
+   │                     │
+   ▼   ▼   ▼   ▼
+Reddit  GDELT  Wiki  Polymarket
+   │      │     │      │
+   ▼      ▼     ▼      ▼
+  HF      —     —      —          (only Reddit needs classifier)
+  classifier
+   │      │     │      │
+   ▼      ▼     ▼      ▼
+  pulse_score (0-100) for each
+   │      │     │      │
+   └──┬───┘     │      │
+      ▼         │      │
+   blend()      │      │           weighted: w ∝ log(1 + N)
+   + divergence │      │
+      │         │      │
+      └─────────┴──────┴────────────► UI
 ```
-
-## What this still doesn't do
-
-Honest list of remaining limitations:
-
-- **Reddit ≠ public.** Reddit users skew younger, male, urban, English-fluent. Country subreddits often skew diaspora/expat. We surface this in the methodology drawer but it's worth repeating.
-- **Search ranking is not random sampling.** Reddit's relevance algorithm boosts engaged content. Loud takes are over-weighted vs. lurkers. The upvote-weighting in our formula doubles down on this — by design (more visible opinions matter more) but worth knowing.
-- **Time window is approximate.** `t=month` filters posts created in the last month, but top comments inside those posts can be slightly older. We surface the actual oldest/newest comment timestamps in the UI.
-- **Classifier is twitter-tuned.** XLM-RoBERTa sentiment was fine-tuned on tweets. Reddit comments are usually longer and more nuanced — the model can miss sarcasm, in-group jokes, and very long arguments.
-- **No topic coherence check.** If you query "AI" in `r/india`, you'll catch threads about AI but also stray comments mentioning "AI" in unrelated discussions. We don't filter for on-topic-ness beyond Reddit's own search relevance.
-- **Single source.** It's still only Reddit. A real political-grade sentiment system would triangulate Reddit + news headlines + Twitter/X + survey data + prediction markets.
 
 ## Files
 
 ```
-pulse-v2/
+pulse-v3/
 ├── app/
-│   ├── api/analyze/route.ts    Main pipeline orchestrator
-│   ├── layout.tsx              Root layout + fonts
-│   ├── page.tsx                The full UI (client component)
-│   └── globals.css             Editorial-minimal styles
+│   ├── api/analyze/route.ts    Orchestrator — parallel source fetch + blend
+│   ├── layout.tsx
+│   ├── page.tsx                Multi-source UI (~900 lines)
+│   └── globals.css
 ├── lib/
-│   ├── countries.ts            Country → subreddit mapping
-│   ├── reddit.ts               OAuth + search + comments
-│   ├── sentiment.ts            HF classifier client
-│   ├── aggregate.ts            Formula + bootstrap CI
-│   └── themes.ts               Claude over measured corpus
-├── package.json
-├── tsconfig.json
-├── next.config.mjs
-├── .env.local.example
-└── README.md                   This file
+│   ├── countries.ts            Country → subreddits mapping
+│   ├── sentiment.ts            HF XLM-RoBERTa client
+│   ├── aggregate.ts            Reddit-only formula (still here, used by redditSource)
+│   ├── themes.ts               Claude over measured corpus
+│   ├── blend.ts                Multi-source blender + divergence calc
+│   └── sources/
+│       ├── reddit.ts           Low-level Reddit OAuth + fetch
+│       ├── redditSource.ts     Wraps reddit + classify + aggregate → SourceResult
+│       ├── gdelt.ts            GDELT 2.0 DOC API (tonechart + artlist)
+│       ├── wikipedia.ts        Pageviews REST API + momentum calc
+│       └── polymarket.ts       Gamma /public-search + match scoring
+├── README.md
+└── ...config files
 ```
+
+## Limitations (still real)
+
+What I addressed in v3:
+- ✅ Single-source dependency → solved by adding 3 more sources
+- ✅ Hidden source bias → surfaced as divergence
+- ✅ "Vibes" attention measurement → real Wikipedia data
+- ✅ No ground-truth conviction signal → Polymarket added when relevant
+
+What's still here:
+- ⚠️ Each source has its own population bias (Reddit = young/urban, GDELT news = English-language press, Polymarket = crypto-native traders, Wikipedia = literate/curious users). All four together is a much better signal than one — but it's still not a national poll.
+- ⚠️ Polymarket only matches well-defined events, not topics. A "housing crisis" query won't find a market because there isn't one. We surface the match score so you can judge.
+- ⚠️ GDELT's country attribution is by publication country, not the country the article is *about*. A Reuters article in the US about India counts as US.
+- ⚠️ Wikipedia language project ≠ country (e.g. en.wikipedia is read in IN/US/GB/PH/SG/NG). For non-Anglophone countries we use the local language Wikipedia, which has its own readership profile.
+- ⚠️ Sarcasm, irony, in-group jokes → still defeat the classifier
+- ⚠️ ~25-45 second latency. Each source has its own slowest path; we're bound by the slowest of the four.
+
+## What's next (v4 ideas)
+
+- **Topic coherence pre-filter** so off-topic comments don't get classified
+- **Recency weighting** — exponential decay on `created_utc` so 3-day-old comments outweigh 25-day-old ones
+- **Sensitivity panel** — show how the index would change if you swapped subreddits / dropped Reddit / dropped GDELT. The "what if" makes the editorial choices visible.
+- **YouTube comments** — adds video-discussion sentiment, separate signal from Reddit
+- **Bluesky** — once it has more reach in non-US contexts, an actually-public Twitter alternative
+- **Time-series mode** — same query weekly, build a chart of how sentiment shifted
 
 ## License
 
-MIT. Do whatever. Just don't claim it's a representative national poll — because it isn't.
+MIT.

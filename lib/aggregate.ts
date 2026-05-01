@@ -1,7 +1,7 @@
 // Aggregation: turn classified comments into a single Pulse Index + breakdown + CI.
 // Formula is documented inline AND surfaced in the UI methodology section.
 
-import type { RedditComment } from './reddit';
+import type { RedditComment } from './sources/reddit';
 import type { SentimentResult } from './sentiment';
 
 export interface ClassifiedComment {

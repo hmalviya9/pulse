@@ -3,23 +3,21 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Search, Loader2, Download, RotateCcw, AlertCircle, Info, ChevronDown, ChevronUp,
-  Sparkles, ExternalLink, BarChart3, FileText, Database
+  Sparkles, ExternalLink, Database, Newspaper, MessageSquare, TrendingUp, DollarSign,
+  Activity, GitBranch, BookOpen
 } from 'lucide-react';
 import { COUNTRIES, type Country } from '@/lib/countries';
 
-const TRENDING = [
-  'AI regulation', 'cost of living', 'climate change', 'elections',
-  'cryptocurrency', 'remote work', 'housing crisis', 'immigration',
-];
+const TRENDING = ['AI regulation', 'cost of living', 'climate change', 'elections', 'cryptocurrency', 'remote work', 'housing crisis', 'immigration'];
 
 const LOADING_MESSAGES = [
   'Authenticating with Reddit…',
-  'Searching country subreddits…',
-  'Fetching top threads…',
-  'Pulling comment trees…',
+  'Querying GDELT global news…',
+  'Fetching Wikipedia pageviews…',
+  'Searching prediction markets…',
   'Running multilingual classifier…',
-  'Computing weighted aggregate…',
-  'Bootstrapping confidence interval…',
+  'Computing source weights…',
+  'Measuring divergence…',
   'Synthesizing themes…',
 ];
 
@@ -28,7 +26,10 @@ const C = {
   ink: '#1A1A1A', inkSoft: '#3A3A3A', inkMute: '#7A7A7A',
   rule: '#D8D4C7', accent: '#C44536',
   positive: '#4A7C59', negative: '#A8392E', neutral: '#8B8680',
+  reddit: '#FF4500', gdelt: '#3B5BDB', wiki: '#36454F', poly: '#0EA5E9',
 };
+
+interface SourceContribution { source: 'reddit' | 'gdelt'; pulse_score: number; weight: number; sample_n: number; }
 
 interface AnalyzeResult {
   ok: true;
@@ -37,27 +38,28 @@ interface AnalyzeResult {
   pulse_index: number;
   pulse_index_low: number;
   pulse_index_high: number;
-  breakdown: { positive: number; neutral: number; negative: number };
-  sample_size: number;
-  thread_count: number;
-  total_upvotes: number;
-  oldest_comment_utc: number;
-  newest_comment_utc: number;
-  classifier_confidence_avg: number;
+  blend: {
+    contributions: SourceContribution[];
+    divergence: number;
+    divergence_label: 'aligned' | 'mixed' | 'split';
+    divergence_note: string;
+    sources_used: number;
+    sources_attempted: number;
+    insufficient: string[];
+  };
+  sources: {
+    reddit: any;
+    gdelt: any;
+    wikipedia: any;
+    polymarket: any;
+  };
   confidence: 'high' | 'medium' | 'low';
-  threads: Array<{ title: string; subreddit: string; score: number; num_comments: number; permalink: string; created_utc: number }>;
-  subreddits_searched: string[];
-  voices: Array<{ excerpt: string; full_length: number; upvotes: number; sentiment: 'positive' | 'neutral' | 'negative'; confidence: number; permalink: string; subreddit: string }>;
-  themes: Array<{ theme: string; sentiment: 'positive' | 'neutral' | 'negative'; description: string; example_count: number }>;
+  themes: Array<{ theme: string; sentiment: string; description: string; example_count: number }>;
   surprise_finding: string;
   headline_verdict: string;
   summary: string;
-  methodology: { sentiment_model: string; formula: string; timing_ms: { reddit: number; classify: number; themes: number; total: number } };
+  methodology: { sentiment_model: string; formula: string; timing_ms: { parallel_fetch: number; themes: number; total: number } };
 }
-
-// ============================================================================
-// HELPERS
-// ============================================================================
 
 function useCountUp(target: number, duration = 1200, run = true) {
   const [value, setValue] = useState(0);
@@ -78,54 +80,20 @@ function useCountUp(target: number, duration = 1200, run = true) {
 }
 
 const sentimentColor = (s: string) => s === 'positive' ? C.positive : s === 'negative' ? C.negative : C.neutral;
-
-const fmtDate = (utc: number) => {
-  if (!utc) return '—';
-  const d = new Date(utc * 1000);
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-};
-
-const fmtNum = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+const fmtDate = (utc: number) => { if (!utc) return '—'; return new Date(utc * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }); };
+const fmtNum = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+const fmtMoney = (n: number) => n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `$${(n / 1000).toFixed(1)}k` : `$${n.toFixed(0)}`;
 
 // ============================================================================
-// COMPONENTS
+// COMMON
 // ============================================================================
 
-function Wordmark({ size = 'sm' as 'sm' | 'lg' }) {
-  const isLg = size === 'lg';
+function Wordmark() {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: C.ink }}>
-      <div style={{ width: isLg ? 14 : 10, height: isLg ? 14 : 10, borderRadius: '50%', background: C.accent, boxShadow: `0 0 0 ${isLg ? 4 : 3}px ${C.accent}22` }} />
-      <span style={{ fontFamily: 'Fraunces, Georgia, serif', fontWeight: 600, fontStyle: 'italic', fontSize: isLg ? 28 : 18, letterSpacing: '-0.02em' }}>
-        Pulse
-      </span>
-      <span style={{ marginLeft: 6, fontSize: 9, fontFamily: 'JetBrains Mono, monospace', padding: '2px 6px', background: C.ink, color: C.bg, letterSpacing: '0.1em' }}>
-        v2
-      </span>
-    </div>
-  );
-}
-
-function SentimentBar({ breakdown, animated = true }: { breakdown: any; animated?: boolean }) {
-  const [w, setW] = useState(animated ? { p: 0, n: 0, neg: 0 } : { p: breakdown.positive, n: breakdown.neutral, neg: breakdown.negative });
-  useEffect(() => {
-    if (!animated) return;
-    const t = setTimeout(() => setW({ p: breakdown.positive, n: breakdown.neutral, neg: breakdown.negative }), 100);
-    return () => clearTimeout(t);
-  }, [breakdown, animated]);
-
-  return (
-    <div>
-      <div style={{ width: '100%', height: 12, display: 'flex', overflow: 'hidden', background: C.rule }}>
-        <div style={{ width: `${w.p}%`, background: C.positive, transition: 'width 1s cubic-bezier(0.16, 1, 0.3, 1)' }} />
-        <div style={{ width: `${w.n}%`, background: C.neutral, transition: 'width 1s cubic-bezier(0.16, 1, 0.3, 1)' }} />
-        <div style={{ width: `${w.neg}%`, background: C.negative, transition: 'width 1s cubic-bezier(0.16, 1, 0.3, 1)' }} />
-      </div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 11, color: C.inkMute, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
-        <span style={{ color: C.positive, fontWeight: 600 }}>● Positive {breakdown.positive}%</span>
-        <span style={{ color: C.neutral, fontWeight: 600 }}>● Neutral {breakdown.neutral}%</span>
-        <span style={{ color: C.negative, fontWeight: 600 }}>● Negative {breakdown.negative}%</span>
-      </div>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      <div style={{ width: 10, height: 10, borderRadius: '50%', background: C.accent, boxShadow: `0 0 0 3px ${C.accent}22` }} />
+      <span style={{ fontFamily: 'Fraunces, Georgia, serif', fontWeight: 600, fontStyle: 'italic', fontSize: 18, letterSpacing: '-0.02em', color: C.ink }}>Pulse</span>
+      <span style={{ marginLeft: 6, fontSize: 9, fontFamily: 'JetBrains Mono, monospace', padding: '2px 6px', background: C.ink, color: C.bg, letterSpacing: '0.1em' }}>v3</span>
     </div>
   );
 }
@@ -144,83 +112,53 @@ function Landing({ onSubmit }: { onSubmit: (c: Country, t: string) => void }) {
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg, padding: '40px 20px', color: C.ink }}>
-      <div style={{ maxWidth: 720, margin: '0 auto' }}>
+      <div style={{ maxWidth: 760, margin: '0 auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 80 }}>
           <Wordmark />
-          <span style={{ fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', color: C.inkMute }}>
-            Public Sentiment Index
-          </span>
+          <span style={{ fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', color: C.inkMute }}>Multi-Source Sentiment</span>
         </div>
 
         <div style={{ marginBottom: 48 }}>
           <div style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.accent, fontWeight: 600, marginBottom: 24 }}>
-            Issue No. 02 · Now With Real Math
+            Issue No. 03 · Triangulation
           </div>
           <h1 style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 'clamp(40px, 7vw, 76px)', lineHeight: 1.02, fontWeight: 400, letterSpacing: '-0.02em', marginBottom: 24 }}>
             What does <span style={{ fontStyle: 'italic', color: C.accent }}>{country ? country.name : 'the world'}</span><br />
             actually think<br />
             about <span style={{ fontStyle: 'italic' }}>{topic.trim() || '___'}</span>?
           </h1>
-          <p style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 20, lineHeight: 1.5, color: C.inkSoft, fontStyle: 'italic', maxWidth: 560 }}>
-            Real Reddit comments. Real multilingual sentiment classifier. Real upvote-weighted aggregate. Confidence intervals. Source links.
+          <p style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 20, lineHeight: 1.5, color: C.inkSoft, fontStyle: 'italic', maxWidth: 600 }}>
+            Reddit's grassroots voice, GDELT's global news tone, Wikipedia's attention curve, Polymarket's money-on-the-line conviction — read together, then the disagreements explained.
           </p>
         </div>
 
-        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 32, padding: 20, background: C.bgWarm, border: `1px solid ${C.rule}` }}>
-          {[
-            { n: 'Reddit OAuth', s: 'Live API, not search' },
-            { n: 'XLM-RoBERTa', s: 'Multilingual classifier' },
-            { n: 'Bootstrap CI', s: '500 resamples per query' },
-            { n: 'Source links', s: 'Verify every comment' },
-          ].map((x, i) => (
-            <div key={i} style={{ flex: '1 1 140px' }}>
-              <div style={{ fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: C.inkMute, marginBottom: 4 }}>
-                {x.n}
-              </div>
-              <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 15, fontStyle: 'italic', color: C.ink }}>
-                {x.s}
-              </div>
-            </div>
-          ))}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12, marginBottom: 32 }}>
+          <SourceBadge color={C.reddit} icon={<MessageSquare size={14} />} name="Reddit" desc="Conversation" sample="~200 comments" />
+          <SourceBadge color={C.gdelt} icon={<Newspaper size={14} />} name="GDELT" desc="News tone" sample="~50–500 articles" />
+          <SourceBadge color={C.wiki} icon={<BookOpen size={14} />} name="Wikipedia" desc="Attention" sample="30-day curve" />
+          <SourceBadge color={C.poly} icon={<DollarSign size={14} />} name="Polymarket" desc="Conviction" sample="When relevant" />
         </div>
 
         <div style={{ borderTop: `1px solid ${C.rule}`, paddingTop: 32, marginBottom: 32 }}>
-          <label style={{ display: 'block', fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', color: C.inkMute, marginBottom: 12, fontWeight: 600 }}>
-            01 — Pick a country
-          </label>
-          <button
-            onClick={() => setShow(!show)}
-            style={{
-              width: '100%', padding: '20px 24px', background: 'transparent',
-              border: `1.5px solid ${country ? C.ink : C.rule}`,
-              fontFamily: 'Fraunces, Georgia, serif', fontSize: 22, fontStyle: country ? 'normal' : 'italic',
-              color: country ? C.ink : C.inkMute, textAlign: 'left', cursor: 'pointer',
-              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-            }}
-          >
+          <label style={{ display: 'block', fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', color: C.inkMute, marginBottom: 12, fontWeight: 600 }}>01 — Pick a country</label>
+          <button onClick={() => setShow(!show)} style={{ width: '100%', padding: '20px 24px', background: 'transparent', border: `1.5px solid ${country ? C.ink : C.rule}`, fontFamily: 'Fraunces, Georgia, serif', fontSize: 22, fontStyle: country ? 'normal' : 'italic', color: country ? C.ink : C.inkMute, textAlign: 'left', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span>{country ? `${country.flag}  ${country.name}` : 'Select a country…'}</span>
             {show ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
           </button>
-
           {show && (
             <div style={{ border: `1.5px solid ${C.ink}`, borderTop: 'none', maxHeight: 320, overflowY: 'auto', background: C.bg }}>
               <div style={{ padding: 12, borderBottom: `1px solid ${C.rule}`, position: 'sticky', top: 0, background: C.bg }}>
                 <div style={{ position: 'relative' }}>
                   <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: C.inkMute }} />
-                  <input
-                    autoFocus type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search countries"
-                    style={{ width: '100%', padding: '8px 12px 8px 32px', border: `1px solid ${C.rule}`, background: C.bg, fontSize: 14, color: C.ink, outline: 'none' }}
-                  />
+                  <input autoFocus type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search countries"
+                    style={{ width: '100%', padding: '8px 12px 8px 32px', border: `1px solid ${C.rule}`, background: C.bg, fontSize: 14, color: C.ink, outline: 'none' }} />
                 </div>
               </div>
               {filtered.map(c => (
-                <button
-                  key={c.code}
-                  onClick={() => { setCountry(c); setShow(false); setSearch(''); }}
+                <button key={c.code} onClick={() => { setCountry(c); setShow(false); setSearch(''); }}
                   style={{ width: '100%', padding: '12px 24px', background: 'transparent', border: 'none', borderBottom: `1px solid ${C.rule}`, fontFamily: 'Fraunces, Georgia, serif', fontSize: 17, color: C.ink, textAlign: 'left', cursor: 'pointer' }}
                   onMouseEnter={(e) => (e.currentTarget.style.background = C.bgWarm)}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-                >
+                  onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}>
                   {c.flag}  {c.name}
                 </button>
               ))}
@@ -229,43 +167,46 @@ function Landing({ onSubmit }: { onSubmit: (c: Country, t: string) => void }) {
         </div>
 
         <div style={{ marginBottom: 48 }}>
-          <label style={{ display: 'block', fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', color: C.inkMute, marginBottom: 12, fontWeight: 600 }}>
-            02 — Enter a topic
-          </label>
-          <input
-            type="text" value={topic} onChange={(e) => setTopic(e.target.value)}
-            placeholder="e.g. AI regulation, the housing market…"
-            style={{ width: '100%', padding: '20px 24px', background: 'transparent', border: `1.5px solid ${topic ? C.ink : C.rule}`, fontFamily: 'Fraunces, Georgia, serif', fontSize: 22, color: C.ink, outline: 'none' }}
-          />
+          <label style={{ display: 'block', fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', color: C.inkMute, marginBottom: 12, fontWeight: 600 }}>02 — Enter a topic</label>
+          <input type="text" value={topic} onChange={(e) => setTopic(e.target.value)} placeholder="e.g. AI regulation, the housing market…"
+            style={{ width: '100%', padding: '20px 24px', background: 'transparent', border: `1.5px solid ${topic ? C.ink : C.rule}`, fontFamily: 'Fraunces, Georgia, serif', fontSize: 22, color: C.ink, outline: 'none' }} />
           <div style={{ marginTop: 14, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
             <span style={{ fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.inkMute, alignSelf: 'center', marginRight: 4 }}>Try:</span>
             {TRENDING.map(t => (
-              <button
-                key={t} onClick={() => setTopic(t)}
+              <button key={t} onClick={() => setTopic(t)}
                 style={{ padding: '4px 10px', background: 'transparent', border: `1px solid ${C.rule}`, fontSize: 12, color: C.inkSoft, cursor: 'pointer' }}
                 onMouseEnter={(e) => { e.currentTarget.style.background = C.ink; e.currentTarget.style.color = C.bg; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = C.inkSoft; }}
-              >
+                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = C.inkSoft; }}>
                 {t}
               </button>
             ))}
           </div>
         </div>
 
-        <button
-          onClick={() => canSubmit && onSubmit(country!, topic.trim())}
-          disabled={!canSubmit}
+        <button onClick={() => canSubmit && onSubmit(country!, topic.trim())} disabled={!canSubmit}
           style={{ width: '100%', padding: '24px', background: canSubmit ? C.ink : C.rule, color: C.bg, border: 'none', fontFamily: 'Fraunces, Georgia, serif', fontSize: 20, fontWeight: 500, cursor: canSubmit ? 'pointer' : 'not-allowed', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12 }}
           onMouseEnter={(e) => { if (canSubmit) e.currentTarget.style.background = C.accent; }}
-          onMouseLeave={(e) => { if (canSubmit) e.currentTarget.style.background = C.ink; }}
-        >
+          onMouseLeave={(e) => { if (canSubmit) e.currentTarget.style.background = C.ink; }}>
           Read the Pulse <span style={{ fontStyle: 'italic' }}>→</span>
         </button>
 
         <p style={{ marginTop: 20, fontSize: 12, color: C.inkMute, textAlign: 'center', fontStyle: 'italic' }}>
-          Typical query: 30–50 seconds. Pulls ~200–300 comments, classifies each, computes weighted aggregate.
+          Four sources fetched in parallel. Typical query: 30–50 seconds.
         </p>
       </div>
+    </div>
+  );
+}
+
+function SourceBadge({ color, icon, name, desc, sample }: any) {
+  return (
+    <div style={{ padding: 16, background: C.bgWarm, border: `1px solid ${C.rule}`, borderTop: `3px solid ${color}` }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, color }}>
+        {icon}
+        <span style={{ fontFamily: 'Inter, sans-serif', fontWeight: 600, fontSize: 13, letterSpacing: '0.02em' }}>{name}</span>
+      </div>
+      <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontStyle: 'italic', fontSize: 14, color: C.ink, marginBottom: 4 }}>{desc}</div>
+      <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: C.inkMute }}>{sample}</div>
     </div>
   );
 }
@@ -277,7 +218,7 @@ function Landing({ onSubmit }: { onSubmit: (c: Country, t: string) => void }) {
 function Loading({ country, topic }: { country: Country; topic: string }) {
   const [idx, setIdx] = useState(0);
   useEffect(() => {
-    const t = setInterval(() => setIdx(i => (i + 1) % LOADING_MESSAGES.length), 4000);
+    const t = setInterval(() => setIdx(i => (i + 1) % LOADING_MESSAGES.length), 3500);
     return () => clearInterval(t);
   }, []);
 
@@ -296,9 +237,8 @@ function Loading({ country, topic }: { country: Country; topic: string }) {
         <div style={{ minHeight: 60, fontFamily: 'Fraunces, Georgia, serif', fontSize: 26, fontStyle: 'italic', lineHeight: 1.3 }}>
           {LOADING_MESSAGES[idx]}
         </div>
-        <div style={{ marginTop: 40, fontSize: 12, color: C.inkMute, maxWidth: 380, margin: '40px auto 0', fontFamily: 'JetBrains Mono, monospace' }}>
-          OAuth → Search → Fetch → Classify → Bootstrap → Synthesize<br />
-          <span style={{ color: C.accent }}>~30–50s typical · classifier cold-start adds 5–10s</span>
+        <div style={{ marginTop: 40, fontSize: 11, color: C.inkMute, fontFamily: 'JetBrains Mono, monospace' }}>
+          4 sources · running in parallel
         </div>
       </div>
     </div>
@@ -312,12 +252,8 @@ function Loading({ country, topic }: { country: Country; topic: string }) {
 function ShareCardSVG({ result, svgRef }: { result: AnalyzeResult; svgRef: React.RefObject<SVGSVGElement> }) {
   const W = 1080, H = 1350, pad = 80;
   const score = result.pulse_index;
-  const b = result.breakdown;
   const themes = result.themes.slice(0, 3);
-  const barY = 760, barW = W - pad * 2;
-  const pW = (b.positive / 100) * barW;
-  const nW = (b.neutral / 100) * barW;
-  const negW = barW - pW - nW;
+  const sourcesLine = result.blend.contributions.map(c => `${c.source}:${c.pulse_score}`).join('  ·  ');
 
   return (
     <svg ref={svgRef} xmlns="http://www.w3.org/2000/svg" width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
@@ -326,8 +262,8 @@ function ShareCardSVG({ result, svgRef }: { result: AnalyzeResult; svgRef: React
       <circle cx={pad + 8} cy={90} r="9" fill={C.accent} />
       <text x={pad + 28} y={98} fontFamily="Fraunces, serif" fontStyle="italic" fontSize="32" fontWeight="600" fill={C.ink}>Pulse</text>
       <rect x={pad + 110} y={75} width="50" height="28" fill={C.ink} />
-      <text x={pad + 135} y={95} fontFamily="JetBrains Mono, monospace" fontSize="14" fill={C.bg} textAnchor="middle" fontWeight="600" letterSpacing="2">v2</text>
-      <text x={W - pad} y={98} fontFamily="Inter, sans-serif" fontSize="18" fill={C.inkMute} textAnchor="end" letterSpacing="3">PUBLIC SENTIMENT INDEX</text>
+      <text x={pad + 135} y={95} fontFamily="JetBrains Mono, monospace" fontSize="14" fill={C.bg} textAnchor="middle" fontWeight="600" letterSpacing="2">v3</text>
+      <text x={W - pad} y={98} fontFamily="Inter, sans-serif" fontSize="18" fill={C.inkMute} textAnchor="end" letterSpacing="3">MULTI-SOURCE INDEX</text>
 
       <text x={pad} y={200} fontFamily="Inter, sans-serif" fontSize="20" letterSpacing="4" fill={C.accent} fontWeight="600">
         {result.country.name.toUpperCase()} · ON
@@ -336,48 +272,54 @@ function ShareCardSVG({ result, svgRef }: { result: AnalyzeResult; svgRef: React
         {result.topic.length > 28 ? result.topic.slice(0, 28) + '…' : result.topic}
       </text>
 
-      <text x={pad} y={500} fontFamily="Fraunces, serif" fontSize="280" fontWeight="300" fill={C.ink} letterSpacing="-12">
-        {score}
-      </text>
+      <text x={pad} y={500} fontFamily="Fraunces, serif" fontSize="280" fontWeight="300" fill={C.ink} letterSpacing="-12">{score}</text>
       <text x={pad + 420} y={460} fontFamily="JetBrains Mono, monospace" fontSize="22" fill={C.inkMute} fontWeight="500">
         ±{Math.round((result.pulse_index_high - result.pulse_index_low) / 2)}
       </text>
       <text x={pad + 420} y={490} fontFamily="Inter, sans-serif" fontSize="14" fill={C.inkMute} letterSpacing="2">
-        50% CI: {result.pulse_index_low}–{result.pulse_index_high}
+        {result.pulse_index_low}–{result.pulse_index_high}
       </text>
       <text x={pad + 20} y={560} fontFamily="Inter, sans-serif" fontSize="20" letterSpacing="3" fill={C.inkMute} fontWeight="600">
-        PULSE INDEX · 0–100
+        BLENDED PULSE · 0–100
       </text>
 
       <text x={pad} y={650} fontFamily="Fraunces, serif" fontSize="36" fontStyle="italic" fill={C.accent} fontWeight="500">
         {(result.headline_verdict || '').slice(0, 60)}
       </text>
 
-      <text x={pad} y={730} fontFamily="Inter, sans-serif" fontSize="14" letterSpacing="3" fill={C.inkMute} fontWeight="600">BREAKDOWN</text>
-      <rect x={pad} y={barY} width={pW} height="20" fill={C.positive} />
-      <rect x={pad + pW} y={barY} width={nW} height="20" fill={C.neutral} />
-      <rect x={pad + pW + nW} y={barY} width={negW} height="20" fill={C.negative} />
-      <text x={pad} y={815} fontFamily="Inter, sans-serif" fontSize="20" fill={C.positive} fontWeight="600">● {b.positive}% positive</text>
-      <text x={pad + 280} y={815} fontFamily="Inter, sans-serif" fontSize="20" fill={C.neutral} fontWeight="600">● {b.neutral}% neutral</text>
-      <text x={pad + 540} y={815} fontFamily="Inter, sans-serif" fontSize="20" fill={C.negative} fontWeight="600">● {b.negative}% negative</text>
+      <text x={pad} y={730} fontFamily="Inter, sans-serif" fontSize="14" letterSpacing="3" fill={C.inkMute} fontWeight="600">SOURCE BREAKDOWN</text>
+      {result.blend.contributions.map((c, i) => (
+        <g key={i} transform={`translate(${pad + i * 250}, 760)`}>
+          <rect width="220" height="80" fill={C.bgWarm} stroke={C.rule} />
+          <rect width="6" height="80" fill={c.source === 'reddit' ? C.reddit : C.gdelt} />
+          <text x={20} y={28} fontFamily="Inter, sans-serif" fontSize="12" letterSpacing="2" fill={C.inkMute} fontWeight="600">{c.source.toUpperCase()}</text>
+          <text x={20} y={62} fontFamily="Fraunces, serif" fontSize="36" fill={C.ink} fontWeight="500">{c.pulse_score}</text>
+          <text x={130} y={62} fontFamily="JetBrains Mono, monospace" fontSize="11" fill={C.inkMute}>n={c.sample_n}</text>
+        </g>
+      ))}
 
-      <line x1={pad} y1={880} x2={W - pad} y2={880} stroke={C.rule} strokeWidth="1" />
-      <text x={pad} y={930} fontFamily="Inter, sans-serif" fontSize="14" letterSpacing="3" fill={C.inkMute} fontWeight="600">DOMINANT THEMES</text>
+      {result.blend.divergence_label !== 'aligned' && (
+        <g transform={`translate(${pad}, 880)`}>
+          <text fontFamily="Inter, sans-serif" fontSize="12" letterSpacing="2" fill={C.accent} fontWeight="600">
+            DIVERGENCE: {result.blend.divergence_label.toUpperCase()} (σ={result.blend.divergence})
+          </text>
+        </g>
+      )}
+
+      <line x1={pad} y1={920} x2={W - pad} y2={920} stroke={C.rule} strokeWidth="1" />
+      <text x={pad} y={970} fontFamily="Inter, sans-serif" fontSize="14" letterSpacing="3" fill={C.inkMute} fontWeight="600">DOMINANT THEMES</text>
       {themes.map((th, i) => (
-        <g key={i} transform={`translate(${pad}, ${980 + i * 90})`}>
+        <g key={i} transform={`translate(${pad}, ${1010 + i * 70})`}>
           <circle cx="10" cy="14" r="8" fill={sentimentColor(th.sentiment)} />
-          <text x="36" y="22" fontFamily="Fraunces, serif" fontSize="32" fill={C.ink} fontWeight="500">{(th.theme || '').slice(0, 38)}</text>
-          <text x="36" y="56" fontFamily="Inter, sans-serif" fontSize="18" fill={C.inkSoft} fontStyle="italic">{(th.description || '').slice(0, 70)}</text>
+          <text x="36" y="22" fontFamily="Fraunces, serif" fontSize="28" fill={C.ink} fontWeight="500">{(th.theme || '').slice(0, 38)}</text>
         </g>
       ))}
 
       <line x1={pad} y1={H - 100} x2={W - pad} y2={H - 100} stroke={C.rule} strokeWidth="1" />
-      <text x={pad} y={H - 50} fontFamily="JetBrains Mono, monospace" fontSize="16" fill={C.inkMute} fontWeight="500">
-        N={result.sample_size} · {result.thread_count} threads · {result.confidence} conf
+      <text x={pad} y={H - 50} fontFamily="JetBrains Mono, monospace" fontSize="14" fill={C.inkMute} fontWeight="500">
+        {result.blend.sources_used}/{result.blend.sources_attempted} sources · {result.confidence} confidence
       </text>
-      <text x={W - pad} y={H - 50} fontFamily="Inter, sans-serif" fontSize="18" fill={C.accent} fontWeight="600" textAnchor="end" letterSpacing="2">
-        pulse.index
-      </text>
+      <text x={W - pad} y={H - 50} fontFamily="Inter, sans-serif" fontSize="18" fill={C.accent} fontWeight="600" textAnchor="end" letterSpacing="2">pulse.index</text>
     </svg>
   );
 }
@@ -403,7 +345,6 @@ function Result({ result, onReset }: { result: AnalyzeResult; onReset: () => voi
       const url = URL.createObjectURL(blob);
       const img = new Image();
       await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = rej; img.src = url; });
-
       const canvas = document.createElement('canvas');
       canvas.width = 1080; canvas.height = 1350;
       const ctx = canvas.getContext('2d')!;
@@ -417,18 +358,19 @@ function Result({ result, onReset }: { result: AnalyzeResult; onReset: () => voi
         a.download = `pulse-${result.country.code}-${result.topic.replace(/\s+/g, '-').toLowerCase().slice(0, 24)}.png`;
         document.body.appendChild(a); a.click(); document.body.removeChild(a);
         URL.revokeObjectURL(pngUrl); URL.revokeObjectURL(url);
-        setDownload('done');
-        setTimeout(() => setDownload('idle'), 2000);
+        setDownload('done'); setTimeout(() => setDownload('idle'), 2000);
       }, 'image/png');
-    } catch (e) {
-      console.error(e);
-      setDownload('idle');
-    }
+    } catch (e) { console.error(e); setDownload('idle'); }
   };
+
+  const reddit = result.sources.reddit;
+  const gdelt = result.sources.gdelt;
+  const wiki = result.sources.wikipedia;
+  const poly = result.sources.polymarket;
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg, color: C.ink, padding: '40px 20px 80px' }}>
-      <div style={{ maxWidth: 720, margin: '0 auto' }}>
+      <div style={{ maxWidth: 760, margin: '0 auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 48 }}>
           <Wordmark />
           <button onClick={onReset} style={{ padding: '8px 14px', background: 'transparent', border: `1px solid ${C.rule}`, fontSize: 12, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.inkSoft, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600 }}>
@@ -446,12 +388,12 @@ function Result({ result, onReset }: { result: AnalyzeResult; onReset: () => voi
               {animScore}
             </div>
             <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 16, color: C.inkMute }}>
-              <div>50% CI</div>
+              <div>RANGE</div>
               <div style={{ fontSize: 22, color: C.ink, fontWeight: 600 }}>{result.pulse_index_low}–{result.pulse_index_high}</div>
             </div>
           </div>
           <div style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.inkMute, marginTop: 16, marginBottom: 32, fontWeight: 600 }}>
-            Pulse Index · 0–100
+            Blended Pulse · {result.blend.sources_used} of {result.blend.sources_attempted} sources
           </div>
           {result.headline_verdict && (
             <h2 style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 'clamp(28px, 4.5vw, 40px)', fontStyle: 'italic', fontWeight: 400, lineHeight: 1.2, color: C.accent, letterSpacing: '-0.01em' }}>
@@ -460,67 +402,155 @@ function Result({ result, onReset }: { result: AnalyzeResult; onReset: () => voi
           )}
         </div>
 
-        {/* THE RECEIPTS — sample size grid */}
-        <div style={{ marginBottom: 56, padding: 28, background: C.bgWarm, border: `1px solid ${C.rule}` }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20 }}>
-            <Database size={14} color={C.accent} />
-            <span style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.accent, fontWeight: 600 }}>The Receipts</span>
+        {/* SOURCE BREAKDOWN — the v3 signature move */}
+        <div style={{ marginBottom: 56 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <GitBranch size={14} color={C.accent} />
+            <span style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.accent, fontWeight: 600 }}>The Triangulation</span>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 24 }}>
-            <Stat label="Comments classified" value={result.sample_size.toString()} />
-            <Stat label="Threads analyzed" value={result.thread_count.toString()} />
-            <Stat label="Subreddits" value={result.subreddits_searched.length.toString()} />
-            <Stat label="Total upvotes" value={fmtNum(result.total_upvotes)} />
-            <Stat label="Confidence" value={result.confidence} colored />
-            <Stat label="Classifier conf." value={`${Math.round(result.classifier_confidence_avg * 100)}%`} />
+          <div style={{ fontSize: 13, color: C.inkMute, fontStyle: 'italic', marginBottom: 24 }}>
+            How each source scored the topic. Disagreement is itself a signal.
           </div>
-          <div style={{ marginTop: 20, paddingTop: 16, borderTop: `1px solid ${C.rule}`, fontFamily: 'JetBrains Mono, monospace', fontSize: 12, color: C.inkSoft }}>
-            Window: {fmtDate(result.oldest_comment_utc)} → {fmtDate(result.newest_comment_utc)}
-          </div>
-        </div>
 
-        {/* BREAKDOWN */}
-        <div style={{ marginBottom: 56, paddingTop: 32, borderTop: `1px solid ${C.rule}` }}>
-          <div style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.inkMute, fontWeight: 600, marginBottom: 8 }}>
-            Sentiment Breakdown
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 16, marginBottom: 24 }}>
+            {/* Reddit card */}
+            <SourceCard color={C.reddit} icon={<MessageSquare size={14} />} name="REDDIT"
+              score={reddit.found ? reddit.pulse_score : null}
+              sample={reddit.found ? `${reddit.sample_size} comments · ${reddit.thread_count} threads` : 'Insufficient data'}
+              weight={result.blend.contributions.find(c => c.source === 'reddit')?.weight} />
+            {/* GDELT card */}
+            <SourceCard color={C.gdelt} icon={<Newspaper size={14} />} name="GDELT NEWS"
+              score={gdelt.found ? gdelt.pulse_score : null}
+              sample={gdelt.found ? `${gdelt.article_count} articles · tone ${gdelt.mean_tone > 0 ? '+' : ''}${gdelt.mean_tone.toFixed(1)}` : 'Insufficient data'}
+              weight={result.blend.contributions.find(c => c.source === 'gdelt')?.weight} />
+            {/* Wikipedia card */}
+            <SourceCard color={C.wiki} icon={<BookOpen size={14} />} name="WIKIPEDIA"
+              score={null}
+              sample={wiki.found ? `${fmtNum(wiki.total_views_30d)} views · ${wiki.momentum}` : 'No article matched'}
+              indicator={wiki.found ? wiki.momentum : null}
+              note="attention, not sentiment" />
+            {/* Polymarket card */}
+            <SourceCard color={C.poly} icon={<DollarSign size={14} />} name="POLYMARKET"
+              score={poly.found ? poly.pulse_score_indicative : null}
+              sample={poly.found ? `${poly.markets.length} markets · ${fmtMoney(poly.total_volume_24h)}/24h` : 'No matching markets'}
+              note={poly.found ? 'event probability, indicative only' : null} />
           </div>
-          <div style={{ fontSize: 12, color: C.inkMute, fontStyle: 'italic', marginBottom: 20 }}>
-            Weighted by log(2 + upvotes) per comment.
-          </div>
-          <SentimentBar breakdown={result.breakdown} />
+
+          {/* Divergence note */}
+          {result.blend.sources_used >= 2 && (
+            <div style={{
+              padding: 20,
+              background: result.blend.divergence_label === 'split' ? `${C.accent}11` :
+                          result.blend.divergence_label === 'mixed' ? C.bgWarm : `${C.positive}11`,
+              border: `1px solid ${result.blend.divergence_label === 'split' ? C.accent :
+                          result.blend.divergence_label === 'mixed' ? C.rule : C.positive}`,
+              borderLeft: `4px solid ${result.blend.divergence_label === 'split' ? C.accent :
+                          result.blend.divergence_label === 'mixed' ? C.neutral : C.positive}`,
+            }}>
+              <div style={{ fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', fontWeight: 600,
+                color: result.blend.divergence_label === 'split' ? C.accent :
+                       result.blend.divergence_label === 'mixed' ? C.inkSoft : C.positive,
+                marginBottom: 6 }}>
+                Sources are {result.blend.divergence_label} (σ={result.blend.divergence})
+              </div>
+              <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 18, lineHeight: 1.4, fontStyle: 'italic' }}>
+                {result.blend.divergence_note}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* SUMMARY */}
         {result.summary && (
           <div style={{ marginBottom: 56, paddingTop: 32, borderTop: `1px solid ${C.rule}` }}>
-            <div style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.inkMute, fontWeight: 600, marginBottom: 20 }}>
-              The Conversation
-            </div>
+            <div style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.inkMute, fontWeight: 600, marginBottom: 20 }}>The Conversation</div>
             <p style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 22, lineHeight: 1.5 }}>{result.summary}</p>
+          </div>
+        )}
+
+        {/* WIKIPEDIA ATTENTION CHART */}
+        {wiki.found && wiki.daily.length > 0 && (
+          <div style={{ marginBottom: 56, paddingTop: 32, borderTop: `1px solid ${C.rule}` }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <Activity size={14} color={C.wiki} />
+              <span style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.wiki, fontWeight: 600 }}>Attention · Last 30 Days</span>
+            </div>
+            <div style={{ fontSize: 13, color: C.inkMute, fontStyle: 'italic', marginBottom: 16 }}>
+              Wikipedia daily pageviews on <a href={wiki.url} target="_blank" rel="noopener noreferrer" style={{ color: C.accent }}>{wiki.article_title}</a> ({wiki.language_project})
+            </div>
+            <SparkChart data={wiki.daily} momentum={wiki.momentum} ratio={wiki.momentum_ratio} />
+          </div>
+        )}
+
+        {/* GDELT ARTICLES */}
+        {gdelt.found && gdelt.articles.length > 0 && (
+          <div style={{ marginBottom: 56, paddingTop: 32, borderTop: `1px solid ${C.rule}` }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <Newspaper size={14} color={C.gdelt} />
+              <span style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.gdelt, fontWeight: 600 }}>Recent News Coverage</span>
+            </div>
+            <div style={{ fontSize: 13, color: C.inkMute, fontStyle: 'italic', marginBottom: 16 }}>
+              {gdelt.article_count} articles tracked. Showing {gdelt.articles.length} most recent.
+            </div>
+            <div>
+              {gdelt.articles.slice(0, 6).map((a: any, i: number) => (
+                <a key={i} href={a.url} target="_blank" rel="noopener noreferrer"
+                   style={{ display: 'block', padding: '12px 0', borderBottom: i < 5 ? `1px solid ${C.rule}` : 'none', textDecoration: 'none', color: C.ink }}>
+                  <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 16, marginBottom: 4, lineHeight: 1.3 }}>
+                    {a.title || '(no title)'}
+                  </div>
+                  <div style={{ fontSize: 11, color: C.inkMute, fontFamily: 'JetBrains Mono, monospace', display: 'flex', gap: 12 }}>
+                    <span>{a.domain}</span>
+                    <span>{a.sourcecountry}</span>
+                    <span>{a.language}</span>
+                  </div>
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* POLYMARKET CARDS */}
+        {poly.found && poly.markets.length > 0 && (
+          <div style={{ marginBottom: 56, paddingTop: 32, borderTop: `1px solid ${C.rule}` }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <DollarSign size={14} color={C.poly} />
+              <span style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.poly, fontWeight: 600 }}>Money on the Line</span>
+            </div>
+            <div style={{ fontSize: 13, color: C.inkMute, fontStyle: 'italic', marginBottom: 20 }}>
+              Polymarket events matching this topic. Probability = current "Yes" price.
+            </div>
+            {poly.markets.map((m: any, i: number) => (
+              <a key={i} href={m.url} target="_blank" rel="noopener noreferrer"
+                 style={{ display: 'block', padding: 16, marginBottom: 12, background: C.bgWarm, border: `1px solid ${C.rule}`, borderLeft: `3px solid ${C.poly}`, textDecoration: 'none', color: C.ink }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 16, flexWrap: 'wrap' }}>
+                  <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 18, flex: 1, lineHeight: 1.3 }}>
+                    {m.question}
+                  </div>
+                  <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 28, fontWeight: 600, color: C.poly }}>
+                    {Math.round(m.yes_probability * 100)}%
+                  </div>
+                </div>
+                <div style={{ marginTop: 8, fontSize: 11, color: C.inkMute, fontFamily: 'JetBrains Mono, monospace', display: 'flex', gap: 12 }}>
+                  <span>24h vol: {fmtMoney(m.volume_24h)}</span>
+                  <span>match: {Math.round(m.match_score * 100)}%</span>
+                </div>
+              </a>
+            ))}
           </div>
         )}
 
         {/* THEMES */}
         {result.themes.length > 0 && (
           <div style={{ marginBottom: 56, paddingTop: 32, borderTop: `1px solid ${C.rule}` }}>
-            <div style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.inkMute, fontWeight: 600, marginBottom: 8 }}>
-              Dominant Themes
-            </div>
-            <div style={{ fontSize: 12, color: C.inkMute, fontStyle: 'italic', marginBottom: 24 }}>
-              Synthesized from the same {result.sample_size} comments measured above.
-            </div>
+            <div style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.inkMute, fontWeight: 600, marginBottom: 24 }}>Dominant Themes</div>
             {result.themes.map((th, i) => (
               <div key={i} style={{ display: 'flex', gap: 20, marginBottom: 24, paddingBottom: 24, borderBottom: i < result.themes.length - 1 ? `1px solid ${C.rule}` : 'none' }}>
                 <div style={{ flexShrink: 0, marginTop: 8 }}>
                   <div style={{ width: 12, height: 12, borderRadius: '50%', background: sentimentColor(th.sentiment) }} />
                 </div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6, gap: 12, flexWrap: 'wrap' }}>
-                    <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 24, fontWeight: 500 }}>{th.theme}</div>
-                    <div style={{ fontSize: 11, letterSpacing: '0.1em', color: C.inkMute, fontFamily: 'JetBrains Mono, monospace' }}>
-                      ~{th.example_count} comments
-                    </div>
-                  </div>
+                  <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 24, fontWeight: 500, marginBottom: 6 }}>{th.theme}</div>
                   <div style={{ fontSize: 15, lineHeight: 1.5, color: C.inkSoft }}>{th.description}</div>
                 </div>
               </div>
@@ -528,30 +558,26 @@ function Result({ result, onReset }: { result: AnalyzeResult; onReset: () => voi
           </div>
         )}
 
-        {/* VOICES */}
-        {result.voices.length > 0 && (
+        {/* REDDIT VOICES */}
+        {reddit.found && reddit.voices && reddit.voices.length > 0 && (
           <div style={{ marginBottom: 56, paddingTop: 32, borderTop: `1px solid ${C.rule}` }}>
-            <div style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.inkMute, fontWeight: 600, marginBottom: 8 }}>
-              Top Voices
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <MessageSquare size={14} color={C.reddit} />
+              <span style={{ fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: C.reddit, fontWeight: 600 }}>Top Reddit Voices</span>
             </div>
             <div style={{ fontSize: 12, color: C.inkMute, fontStyle: 'italic', marginBottom: 24 }}>
-              Highest-upvoted comments per sentiment bucket. Excerpts only — click to read in full on Reddit.
+              Excerpts only. Click to read full comment on Reddit.
             </div>
-            {result.voices.map((v, i) => (
+            {reddit.voices.map((v: any, i: number) => (
               <a key={i} href={v.permalink} target="_blank" rel="noopener noreferrer"
-                 style={{ display: 'block', marginBottom: 16, paddingLeft: 20, borderLeft: `3px solid ${sentimentColor(v.sentiment)}`, textDecoration: 'none', transition: 'transform 0.15s' }}
-                 onMouseEnter={(e) => (e.currentTarget.style.transform = 'translateX(4px)')}
-                 onMouseLeave={(e) => (e.currentTarget.style.transform = 'translateX(0)')}>
-                <p style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 19, lineHeight: 1.45, color: C.ink, fontStyle: 'italic', margin: 0 }}>
+                 style={{ display: 'block', marginBottom: 16, paddingLeft: 20, borderLeft: `3px solid ${sentimentColor(v.sentiment)}`, textDecoration: 'none' }}>
+                <p style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 18, lineHeight: 1.45, color: C.ink, fontStyle: 'italic', margin: 0 }}>
                   "{v.excerpt}"
                 </p>
                 <div style={{ marginTop: 6, display: 'flex', gap: 14, fontSize: 11, color: C.inkMute, fontFamily: 'JetBrains Mono, monospace' }}>
                   <span>r/{v.subreddit}</span>
                   <span>↑ {v.upvotes}</span>
                   <span style={{ color: sentimentColor(v.sentiment) }}>● {v.sentiment} {Math.round(v.confidence * 100)}%</span>
-                  <span style={{ color: C.accent, marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 4 }}>
-                    Read full <ExternalLink size={11} />
-                  </span>
                 </div>
               </a>
             ))}
@@ -568,34 +594,6 @@ function Result({ result, onReset }: { result: AnalyzeResult; onReset: () => voi
             <p style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 22, lineHeight: 1.45 }}>{result.surprise_finding}</p>
           </div>
         )}
-
-        {/* SOURCES — collapsible */}
-        <div style={{ marginBottom: 32, paddingTop: 32, borderTop: `1px solid ${C.rule}` }}>
-          <button onClick={() => setSourcesOpen(!sourcesOpen)} style={{ width: '100%', padding: 0, background: 'transparent', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12, letterSpacing: '0.15em', textTransform: 'uppercase', color: C.inkMute, fontWeight: 600 }}>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <FileText size={14} /> Source Threads ({result.threads.length})
-            </span>
-            {sourcesOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-          </button>
-          {sourcesOpen && (
-            <div style={{ marginTop: 20 }}>
-              {result.threads.map((t, i) => (
-                <a key={i} href={t.permalink} target="_blank" rel="noopener noreferrer"
-                   style={{ display: 'block', padding: '14px 0', borderBottom: i < result.threads.length - 1 ? `1px solid ${C.rule}` : 'none', textDecoration: 'none', color: C.ink }}>
-                  <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 17, marginBottom: 4, lineHeight: 1.3 }}>
-                    {t.title}
-                  </div>
-                  <div style={{ fontSize: 11, color: C.inkMute, fontFamily: 'JetBrains Mono, monospace', display: 'flex', gap: 12 }}>
-                    <span>r/{t.subreddit}</span>
-                    <span>↑ {t.score}</span>
-                    <span>💬 {t.num_comments}</span>
-                    <span>{fmtDate(t.created_utc)}</span>
-                  </div>
-                </a>
-              ))}
-            </div>
-          )}
-        </div>
 
         {/* SHARE */}
         <div style={{ marginBottom: 56, paddingTop: 32, borderTop: `2px solid ${C.ink}` }}>
@@ -621,34 +619,35 @@ function Result({ result, onReset }: { result: AnalyzeResult; onReset: () => voi
           </button>
           {methodOpen && (
             <div style={{ marginTop: 24, fontSize: 14, lineHeight: 1.7, color: C.inkSoft }}>
-              <Method title="Data source">
-                Live Reddit OAuth API. Searched {result.subreddits_searched.length} subreddits ({result.subreddits_searched.map(s => `r/${s}`).join(', ')}) using Reddit's <code style={{ fontFamily: 'JetBrains Mono, monospace', background: C.bgWarm, padding: '1px 5px' }}>search.json</code> endpoint with <code style={{ fontFamily: 'JetBrains Mono, monospace', background: C.bgWarm, padding: '1px 5px' }}>t=month</code> filter. Top {result.thread_count} threads by comment count, then top comments by upvote score per thread. {result.sample_size} comments classified.
-              </Method>
-              <Method title="Sentiment classifier">
-                <code style={{ fontFamily: 'JetBrains Mono, monospace', background: C.bgWarm, padding: '1px 5px' }}>{result.methodology.sentiment_model}</code> via Hugging Face Inference API. Multilingual XLM-RoBERTa fine-tuned on ~198M tweets in 8 languages, supports 30+ languages for inference. Output: 3-class probabilities (positive/neutral/negative) per comment.
+              <Method title="Sources & weights">
+                <strong>Reddit</strong>: live OAuth, top comments classified by XLM-RoBERTa multilingual sentiment. Weight ∝ min(1, N/200).<br />
+                <strong>GDELT</strong>: 2.0 DOC API, country-filtered news tone histogram. Weight ∝ min(1, articles/100).<br />
+                <strong>Wikipedia</strong>: REST pageviews API, last 30 days, country-language project. Surfaced as attention signal — does NOT enter the blended Pulse Index.<br />
+                <strong>Polymarket</strong>: Gamma API public-search. Surfaced as a separate "money on the line" signal, NOT blended (event probability ≠ topic sentiment).
               </Method>
               <Method title="Pulse Index formula">
-                <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 13, background: C.bgWarm, padding: 12, marginTop: 8, lineHeight: 1.6 }}>
-                  weight(c) = log(2 + max(0, upvotes_c))<br />
-                  signed(c) = P(positive | c) − P(negative | c)<br />
-                  score = round(50 × (1 + Σ weight(c)·signed(c) / Σ weight(c)))
-                </div>
-                <div style={{ marginTop: 8, fontSize: 13 }}>
-                  CI: 500-sample bootstrap, 25th/75th percentiles. Result: {result.pulse_index_low}–{result.pulse_index_high}.
+                <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 13, background: C.bgWarm, padding: 12, lineHeight: 1.6 }}>
+                  pulse = round(Σ source_score × weight / Σ weight)<br />
+                  divergence = round(stddev(source_scores))<br />
+                  CI half-width = max(reddit_bootstrap_ci/2, divergence)
                 </div>
               </Method>
-              <Method title="Confidence band">
-                Sample size N={result.sample_size}: {result.confidence}. (≥200 = high · 80–199 = medium · &lt;80 = low)
+              <Method title="Why we don't blend Polymarket / Wikipedia">
+                Polymarket prices are <em>event probabilities</em> ("Will X happen by Y?"), not <em>topic sentiment</em> ("Do people feel positive about X?"). Blending them would be a category error. Same for Wikipedia: pageviews measure <em>attention</em>, not <em>opinion</em>. We surface these as parallel signals so you can read them in context — divergence between attention and sentiment is itself useful.
               </Method>
-              <Method title="Known biases">
-                Reddit users skew younger, more male, more urban, and more English-fluent than the general population of {result.country.name}. Country-specific subreddits often skew toward expat / diaspora / educated-professional voices. Search relevance ranking favors threads engagement, so loud minority opinions are over-represented vs lurkers. <strong style={{ color: C.ink }}>This is a measurement of upvote-weighted Reddit-active opinion — not a national poll.</strong>
+              <Method title="Known biases (still here in v3)">
+                Reddit users skew young/male/urban/English-fluent. Country subreddits skew expat/diaspora. GDELT's source-country attribution is based on publication country and isn't perfect. Wikipedia language-project ≠ country (e.g. en.wikipedia is read worldwide). All four sources skew toward issues with English-language footprints.
+              </Method>
+              <Method title="What's better than v2">
+                Single-source v2 had no way to know if Reddit was telling you the typical story or an outlier story. v3 makes that visible: when Reddit and news media disagree by 15+ points, it shows up as <em>divergence: split</em> with an explanation. The headline number is still imperfect — but you can see when it's likely to be wrong.
               </Method>
               <Method title="Performance">
                 <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 12, color: C.inkSoft }}>
-                  Reddit fetch: {result.methodology.timing_ms.reddit}ms<br />
-                  Classification: {result.methodology.timing_ms.classify}ms<br />
+                  Parallel fetch (4 sources): {result.methodology.timing_ms.parallel_fetch}ms<br />
                   Theme synthesis: {result.methodology.timing_ms.themes}ms<br />
-                  Total: {result.methodology.timing_ms.total}ms
+                  Total: {result.methodology.timing_ms.total}ms<br />
+                  Sources used: {result.blend.sources_used} / {result.blend.sources_attempted} sentiment-bearing
+                  {result.blend.insufficient.length > 0 && <><br />Insufficient: {result.blend.insufficient.join(', ')}</>}
                 </div>
               </Method>
             </div>
@@ -659,17 +658,69 @@ function Result({ result, onReset }: { result: AnalyzeResult; onReset: () => voi
   );
 }
 
-function Stat({ label, value, colored }: { label: string; value: string; colored?: boolean }) {
-  let color = C.ink;
-  if (colored) {
-    if (value === 'high') color = C.positive;
-    else if (value === 'low') color = C.negative;
-    else color = C.inkSoft;
-  }
+function SourceCard({ color, icon, name, score, sample, weight, indicator, note }: any) {
+  const isUnavailable = score === null && !indicator;
+  return (
+    <div style={{ padding: 18, background: isUnavailable ? 'transparent' : C.bgWarm, border: `1px solid ${C.rule}`, borderTop: `3px solid ${color}`, opacity: isUnavailable ? 0.5 : 1 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, color }}>
+        {icon}
+        <span style={{ fontFamily: 'Inter, sans-serif', fontWeight: 600, fontSize: 11, letterSpacing: '0.1em' }}>{name}</span>
+      </div>
+      {score !== null && score !== undefined && (
+        <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 44, fontWeight: 400, lineHeight: 1, marginBottom: 6, color: C.ink }}>
+          {score}
+        </div>
+      )}
+      {indicator && !score && (
+        <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 24, fontStyle: 'italic', fontWeight: 500, lineHeight: 1, marginBottom: 8, color, textTransform: 'capitalize' }}>
+          {indicator}
+        </div>
+      )}
+      {isUnavailable && (
+        <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 16, fontStyle: 'italic', color: C.inkMute, marginBottom: 8 }}>—</div>
+      )}
+      <div style={{ fontSize: 11, color: C.inkMute, fontFamily: 'JetBrains Mono, monospace', lineHeight: 1.4 }}>{sample}</div>
+      {weight !== undefined && (
+        <div style={{ marginTop: 8, fontSize: 9, color: C.inkMute, letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+          weight {(weight * 100).toFixed(0)}%
+        </div>
+      )}
+      {note && (
+        <div style={{ marginTop: 8, fontSize: 10, color: C.inkMute, fontStyle: 'italic' }}>{note}</div>
+      )}
+    </div>
+  );
+}
+
+function SparkChart({ data, momentum, ratio }: { data: Array<{ date: string; views: number }>; momentum: string; ratio: number }) {
+  const W = 700, H = 120, pad = 8;
+  const max = Math.max(...data.map(d => d.views), 1);
+  const points = data.map((d, i) => {
+    const x = pad + (i / (data.length - 1)) * (W - pad * 2);
+    const y = H - pad - (d.views / max) * (H - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+
+  const momColor = momentum === 'surging' ? C.accent : momentum === 'rising' ? C.positive : momentum === 'fading' ? C.negative : C.neutral;
+
   return (
     <div>
-      <div style={{ fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: C.inkMute, marginBottom: 6, fontWeight: 600 }}>{label}</div>
-      <div style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 32, fontWeight: 500, color, lineHeight: 1, textTransform: colored ? 'capitalize' as const : 'none' as const }}>{value}</div>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block', maxHeight: 160 }}>
+        <polyline points={points} fill="none" stroke={momColor} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+        {data.map((d, i) => {
+          const x = pad + (i / (data.length - 1)) * (W - pad * 2);
+          const y = H - pad - (d.views / max) * (H - pad * 2);
+          return <circle key={i} cx={x} cy={y} r="1.5" fill={momColor} />;
+        })}
+        {/* split line at last 7 days */}
+        {data.length >= 7 && (
+          <line x1={pad + ((data.length - 7) / (data.length - 1)) * (W - pad * 2)} y1={pad} x2={pad + ((data.length - 7) / (data.length - 1)) * (W - pad * 2)} y2={H - pad} stroke={C.rule} strokeDasharray="3,3" />
+        )}
+      </svg>
+      <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', fontSize: 11, color: C.inkMute, fontFamily: 'JetBrains Mono, monospace' }}>
+        <span>{data[0]?.date} → {data[data.length - 1]?.date}</span>
+        <span style={{ color: momColor, fontWeight: 600, textTransform: 'uppercase' }}>{momentum} · ×{ratio.toFixed(2)}</span>
+      </div>
     </div>
   );
 }
@@ -692,10 +743,8 @@ function ErrorScreen({ message, onReset }: { message: string; onReset: () => voi
     <div style={{ minHeight: '100vh', background: C.bg, color: C.ink, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', padding: 24 }}>
       <div style={{ maxWidth: 480, textAlign: 'center' }}>
         <AlertCircle size={48} color={C.accent} style={{ marginBottom: 32 }} />
-        <h2 style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 36, fontStyle: 'italic', marginBottom: 16, lineHeight: 1.2 }}>
-          The signal got lost.
-        </h2>
-        <p style={{ fontSize: 15, color: C.inkSoft, marginBottom: 32, lineHeight: 1.6 }}>{message}</p>
+        <h2 style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 36, fontStyle: 'italic', marginBottom: 16, lineHeight: 1.2 }}>The signal got lost.</h2>
+        <p style={{ fontSize: 15, color: C.inkSoft, marginBottom: 32, lineHeight: 1.6, whiteSpace: 'pre-line' }}>{message}</p>
         <button onClick={onReset} style={{ padding: '16px 32px', background: C.ink, color: C.bg, border: 'none', fontFamily: 'Fraunces, Georgia, serif', fontSize: 17, cursor: 'pointer' }}>
           Try again →
         </button>
@@ -725,21 +774,16 @@ export default function Page() {
         body: JSON.stringify({ country_code: c.code, topic: t }),
       });
       const data = await res.json();
-
       if (data.error) {
         if (data.error === 'INSUFFICIENT_DATA') {
-          setError(data.message + (data.debug ? `\n\nDiagnostic: ${data.debug.posts_found} posts, ${data.debug.comments_found} comments found.` : ''));
+          setError(data.message + (data.debug ? `\n\nDiagnostic: Reddit ${data.debug.reddit_comments} comments, GDELT ${data.debug.gdelt_articles} articles, Wikipedia ${data.debug.wiki_found ? 'found' : 'no match'}, Polymarket ${data.debug.polymarket_found ? 'matched' : 'no markets'}.` : ''));
         } else {
           setError(data.message || 'Something went wrong.');
         }
-        setStage('error');
-        return;
+        setStage('error'); return;
       }
-
-      // Min 3s ritual
       const elapsed = Date.now() - t0;
       if (elapsed < 3000) await new Promise(r => setTimeout(r, 3000 - elapsed));
-
       setResult(data); setStage('result');
     } catch (e: any) {
       setError(e.message || 'Network error'); setStage('error');
