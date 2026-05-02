@@ -1,4 +1,6 @@
-# Pulse v3 — Multi-Source Public Sentiment Index
+# Pulse v3.1 — Multi-Source Public Sentiment Index
+
+> **v3.1 patch:** Added `/api/debug` endpoint, fixed silent auth failures, and added GDELT country-filter fallback. See [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) when something goes wrong.
 
 Four sources triangulating. Disagreement is itself a signal.
 

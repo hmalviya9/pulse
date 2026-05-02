@@ -738,13 +738,100 @@ function Method({ title, children }: { title: string; children: React.ReactNode 
 // ERROR
 // ============================================================================
 
-function ErrorScreen({ message, onReset }: { message: string; onReset: () => void }) {
+interface ErrorState {
+  kind: 'config' | 'insufficient' | 'network' | 'unknown';
+  message: string;
+  fatal_errors?: string[];
+  diagnostics?: any;
+  debug_url?: string;
+}
+
+function ErrorScreen({ err, onReset }: { err: ErrorState; onReset: () => void }) {
+  const isConfig = err.kind === 'config';
+  const isInsufficient = err.kind === 'insufficient';
+
   return (
-    <div style={{ minHeight: '100vh', background: C.bg, color: C.ink, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', padding: 24 }}>
-      <div style={{ maxWidth: 480, textAlign: 'center' }}>
-        <AlertCircle size={48} color={C.accent} style={{ marginBottom: 32 }} />
-        <h2 style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 36, fontStyle: 'italic', marginBottom: 16, lineHeight: 1.2 }}>The signal got lost.</h2>
-        <p style={{ fontSize: 15, color: C.inkSoft, marginBottom: 32, lineHeight: 1.6, whiteSpace: 'pre-line' }}>{message}</p>
+    <div style={{ minHeight: '100vh', background: C.bg, color: C.ink, padding: '40px 20px' }}>
+      <div style={{ maxWidth: 720, margin: '0 auto' }}>
+        <div style={{ marginBottom: 48 }}><Wordmark /></div>
+
+        <AlertCircle size={48} color={C.accent} style={{ marginBottom: 24 }} />
+
+        <h2 style={{ fontFamily: 'Fraunces, Georgia, serif', fontSize: 40, fontStyle: 'italic', marginBottom: 16, lineHeight: 1.1 }}>
+          {isConfig ? 'Configuration problem.' : isInsufficient ? 'Not enough data.' : 'Something broke.'}
+        </h2>
+
+        <p style={{ fontSize: 16, color: C.inkSoft, marginBottom: 32, lineHeight: 1.6, whiteSpace: 'pre-line' }}>
+          {err.message}
+        </p>
+
+        {err.fatal_errors && err.fatal_errors.length > 0 && (
+          <div style={{ marginBottom: 32, padding: 20, background: `${C.accent}11`, border: `1px solid ${C.accent}`, borderLeft: `4px solid ${C.accent}` }}>
+            <div style={{ fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', fontWeight: 600, color: C.accent, marginBottom: 12 }}>
+              Fatal errors detected
+            </div>
+            {err.fatal_errors.map((e, i) => (
+              <div key={i} style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 13, color: C.ink, marginBottom: 8, lineHeight: 1.5 }}>
+                {e}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {err.diagnostics && (
+          <div style={{ marginBottom: 32, padding: 20, background: C.bgWarm, border: `1px solid ${C.rule}` }}>
+            <div style={{ fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', fontWeight: 600, color: C.inkMute, marginBottom: 12 }}>
+              Per-source results
+            </div>
+            <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 12, color: C.inkSoft, lineHeight: 1.7 }}>
+              {err.diagnostics.reddit && (
+                <div>
+                  <strong style={{ color: C.ink }}>Reddit</strong>: {err.diagnostics.reddit.auth_succeeded === false ? '❌ auth failed' : `${err.diagnostics.reddit.total_comments_after_filter ?? 0} comments`}
+                  {err.diagnostics.reddit.per_subreddit && err.diagnostics.reddit.per_subreddit.length > 0 && (
+                    <div style={{ marginLeft: 16, marginTop: 4, fontSize: 11 }}>
+                      {err.diagnostics.reddit.per_subreddit.map((s: any, i: number) => (
+                        <div key={i}>r/{s.subreddit}: {s.posts_after_filter} posts ({s.time_window_used}){s.error ? ` · err: ${s.error.slice(0, 60)}` : ''}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {err.diagnostics.gdelt && (
+                <div style={{ marginTop: 8 }}>
+                  <strong style={{ color: C.ink }}>GDELT</strong>: HTTP {err.diagnostics.gdelt.http_status ?? '?'} · country filter "{err.diagnostics.gdelt.country_filter_attempted ?? 'none'}" → {err.diagnostics.gdelt.country_filter_articles} articles · fallback {err.diagnostics.gdelt.fallback_used ? 'used' : 'not needed/skipped'}
+                  {err.diagnostics.gdelt.raw_error && <div style={{ marginLeft: 16, color: C.negative }}>err: {err.diagnostics.gdelt.raw_error}</div>}
+                </div>
+              )}
+              <div style={{ marginTop: 8 }}>
+                <strong style={{ color: C.ink }}>Wikipedia</strong>: {err.diagnostics.wiki_found ? '✓ found article' : '— no match'}
+                {' · '}
+                <strong style={{ color: C.ink }}>Polymarket</strong>: {err.diagnostics.polymarket_found ? '✓ matched markets' : '— no markets'}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {err.debug_url && (
+          <div style={{ marginBottom: 24 }}>
+            <a href={err.debug_url} target="_blank" rel="noopener noreferrer"
+               style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '12px 20px', background: 'transparent', border: `1px solid ${C.ink}`, color: C.ink, textDecoration: 'none', fontFamily: 'JetBrains Mono, monospace', fontSize: 13 }}>
+              <Database size={14} /> Open /api/debug for full diagnostics →
+            </a>
+          </div>
+        )}
+
+        {isConfig && (
+          <div style={{ marginBottom: 32, padding: 20, background: C.bgWarm, border: `1px solid ${C.rule}` }}>
+            <div style={{ fontSize: 13, color: C.inkSoft, lineHeight: 1.7 }}>
+              <strong style={{ color: C.ink }}>Most likely fix:</strong><br />
+              1. Open <code style={{ fontFamily: 'JetBrains Mono, monospace', background: C.bg, padding: '1px 5px' }}>.env.local</code><br />
+              2. Verify <code style={{ fontFamily: 'JetBrains Mono, monospace', background: C.bg, padding: '1px 5px' }}>REDDIT_CLIENT_ID</code> and <code style={{ fontFamily: 'JetBrains Mono, monospace', background: C.bg, padding: '1px 5px' }}>REDDIT_CLIENT_SECRET</code> match your script app at <a href="https://www.reddit.com/prefs/apps" target="_blank" rel="noopener noreferrer" style={{ color: C.accent }}>reddit.com/prefs/apps</a><br />
+              3. Make sure <code style={{ fontFamily: 'JetBrains Mono, monospace', background: C.bg, padding: '1px 5px' }}>REDDIT_USER_AGENT</code> includes your username, e.g. <code style={{ fontFamily: 'JetBrains Mono, monospace', background: C.bg, padding: '1px 5px' }}>pulse-sentiment/1.0 by /u/yourname</code><br />
+              4. Restart <code style={{ fontFamily: 'JetBrains Mono, monospace', background: C.bg, padding: '1px 5px' }}>npm run dev</code>
+            </div>
+          </div>
+        )}
+
         <button onClick={onReset} style={{ padding: '16px 32px', background: C.ink, color: C.bg, border: 'none', fontFamily: 'Fraunces, Georgia, serif', fontSize: 17, cursor: 'pointer' }}>
           Try again →
         </button>
@@ -762,7 +849,7 @@ export default function Page() {
   const [country, setCountry] = useState<Country | null>(null);
   const [topic, setTopic] = useState('');
   const [result, setResult] = useState<AnalyzeResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ErrorState | null>(null);
 
   const submit = async (c: Country, t: string) => {
     setCountry(c); setTopic(t); setStage('loading'); setError(null);
@@ -774,11 +861,15 @@ export default function Page() {
         body: JSON.stringify({ country_code: c.code, topic: t }),
       });
       const data = await res.json();
+      const debugUrl = `/api/debug?country=${c.code}&topic=${encodeURIComponent(t)}`;
+
       if (data.error) {
-        if (data.error === 'INSUFFICIENT_DATA') {
-          setError(data.message + (data.debug ? `\n\nDiagnostic: Reddit ${data.debug.reddit_comments} comments, GDELT ${data.debug.gdelt_articles} articles, Wikipedia ${data.debug.wiki_found ? 'found' : 'no match'}, Polymarket ${data.debug.polymarket_found ? 'matched' : 'no markets'}.` : ''));
+        if (data.error === 'CONFIGURATION_ERROR') {
+          setError({ kind: 'config', message: data.message, fatal_errors: data.fatal_errors, diagnostics: data.diagnostics, debug_url: debugUrl });
+        } else if (data.error === 'INSUFFICIENT_DATA') {
+          setError({ kind: 'insufficient', message: data.message, diagnostics: data.diagnostics, debug_url: debugUrl });
         } else {
-          setError(data.message || 'Something went wrong.');
+          setError({ kind: 'unknown', message: data.message || 'Something went wrong.', debug_url: debugUrl });
         }
         setStage('error'); return;
       }
@@ -786,7 +877,8 @@ export default function Page() {
       if (elapsed < 3000) await new Promise(r => setTimeout(r, 3000 - elapsed));
       setResult(data); setStage('result');
     } catch (e: any) {
-      setError(e.message || 'Network error'); setStage('error');
+      setError({ kind: 'network', message: e.message || 'Network error' });
+      setStage('error');
     }
   };
 
@@ -797,7 +889,7 @@ export default function Page() {
       {stage === 'landing' && <Landing onSubmit={submit} />}
       {stage === 'loading' && country && <Loading country={country} topic={topic} />}
       {stage === 'result' && result && <Result result={result} onReset={reset} />}
-      {stage === 'error' && <ErrorScreen message={error || 'Unknown error'} onReset={reset} />}
+      {stage === 'error' && <ErrorScreen err={error || { kind: 'unknown', message: 'Unknown error' }} onReset={reset} />}
     </main>
   );
 }

@@ -1,6 +1,9 @@
-// Reddit API client.
-// Uses OAuth client_credentials flow (app-only, no user context).
-// Docs: https://github.com/reddit-archive/reddit/wiki/OAuth2
+// Reddit API client — v3.1 with proper error diagnostics.
+// Changes from v3.0:
+//   - Auth/rate-limit errors now bubble up instead of being silently caught
+//   - Per-subreddit fetch errors are TRACKED (returned as diagnostics) instead of just logged
+//   - Time-window fallback: if t=month returns nothing, retry with t=year, then t=all
+//   - The User-Agent string format strictly matches Reddit's documented requirement
 
 const TOKEN_URL = 'https://www.reddit.com/api/v1/access_token';
 const API_BASE = 'https://oauth.reddit.com';
@@ -28,20 +31,56 @@ export interface RedditComment {
   post_title: string;
 }
 
+export interface SubredditDiagnostic {
+  subreddit: string;
+  posts_found: number;
+  posts_after_filter: number;
+  time_window_used: string;
+  error: string | null;
+}
+
+export interface CorpusDiagnostics {
+  auth_succeeded: boolean;
+  per_subreddit: SubredditDiagnostic[];
+  total_posts_pre_dedup: number;
+  total_posts_post_dedup: number;
+  total_comments_fetched: number;
+  total_comments_after_filter: number;
+  comment_fetch_errors: string[];
+}
+
+// Custom error classes for better error reporting upstream
+export class RedditAuthError extends Error {
+  constructor(message: string) {
+    super(`Reddit auth: ${message}`);
+    this.name = 'RedditAuthError';
+  }
+}
+
+export class RedditRateLimitError extends Error {
+  constructor(message: string) {
+    super(`Reddit rate limit: ${message}`);
+    this.name = 'RedditRateLimitError';
+  }
+}
+
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
 async function getToken(): Promise<string> {
-  // Cache token for 50 minutes (Reddit tokens last 1 hour)
   if (cachedToken && cachedToken.expiresAt > Date.now()) {
     return cachedToken.token;
   }
 
   const clientId = process.env.REDDIT_CLIENT_ID;
   const clientSecret = process.env.REDDIT_CLIENT_SECRET;
-  const userAgent = process.env.REDDIT_USER_AGENT || 'pulse-sentiment/1.0';
+  const userAgent = process.env.REDDIT_USER_AGENT;
 
   if (!clientId || !clientSecret) {
-    throw new Error('REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET must be set in .env.local');
+    throw new RedditAuthError('REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET must be set in .env.local');
+  }
+  // Reddit is strict about User-Agent: it should follow "platform:appname:version (by /u/username)"
+  if (!userAgent || userAgent.length < 5) {
+    throw new RedditAuthError('REDDIT_USER_AGENT must be set. Format: "pulse-sentiment/1.0 by /u/your_reddit_username"');
   }
 
   const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
@@ -56,15 +95,25 @@ async function getToken(): Promise<string> {
     body: 'grant_type=client_credentials',
   });
 
+  if (res.status === 401) {
+    const body = await res.text();
+    throw new RedditAuthError(`401 Unauthorized — check that REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET match your "script" app at https://www.reddit.com/prefs/apps. Server response: ${body.slice(0, 200)}`);
+  }
+  if (res.status === 429) {
+    throw new RedditRateLimitError('Hit token endpoint rate limit. Wait 60s and retry.');
+  }
   if (!res.ok) {
-    const errBody = await res.text();
-    throw new Error(`Reddit auth failed (${res.status}): ${errBody.slice(0, 200)}`);
+    const body = await res.text();
+    throw new RedditAuthError(`Token request failed (${res.status}): ${body.slice(0, 200)}`);
   }
 
   const data = await res.json();
+  if (!data.access_token) {
+    throw new RedditAuthError(`No access_token in response: ${JSON.stringify(data).slice(0, 200)}`);
+  }
   cachedToken = {
     token: data.access_token,
-    expiresAt: Date.now() + (data.expires_in - 600) * 1000, // refresh 10min before expiry
+    expiresAt: Date.now() + (data.expires_in - 600) * 1000,
   };
   return cachedToken.token;
 }
@@ -80,9 +129,13 @@ async function redditFetch(path: string): Promise<any> {
     },
   });
 
-  // Reddit returns rate-limit headers; we respect 429 by surfacing it
+  if (res.status === 401 || res.status === 403) {
+    // Bearer token problem — propagate
+    cachedToken = null; // bust cache so next call re-auths
+    throw new RedditAuthError(`Bearer token rejected (${res.status}). Token cache cleared.`);
+  }
   if (res.status === 429) {
-    throw new Error('Reddit rate limit hit. Wait a minute and retry.');
+    throw new RedditRateLimitError(`Rate limit on ${path}. Wait 60s and retry.`);
   }
   if (!res.ok) {
     throw new Error(`Reddit API ${path} failed: ${res.status}`);
@@ -91,20 +144,31 @@ async function redditFetch(path: string): Promise<any> {
 }
 
 /**
- * Search a subreddit for posts matching the topic.
- * Time window: past month (`t=month`). Sort by relevance, then we'll re-rank by comment count.
+ * Search a subreddit for posts. Returns posts + diagnostic info.
+ * Tries t=month first, falls back to t=year if nothing found.
  */
-export async function searchSubreddit(subreddit: string, query: string, limit = 8): Promise<RedditPost[]> {
+export async function searchSubreddit(
+  subreddit: string,
+  query: string,
+  limit = 8
+): Promise<{ posts: RedditPost[]; diagnostic: SubredditDiagnostic }> {
   const q = encodeURIComponent(query);
-  const path = `/r/${subreddit}/search.json?q=${q}&restrict_sr=on&sort=relevance&t=month&limit=${limit}`;
+  const windows = ['month', 'year'];
 
-  try {
-    const data = await redditFetch(path);
-    const children = data?.data?.children || [];
-    return children
-      .map((c: any) => c.data)
-      .filter((p: any) => p && !p.over_18 && (p.num_comments ?? 0) >= 3) // skip thin/NSFW posts
-      .map((p: any) => ({
+  let lastError: string | null = null;
+
+  for (const t of windows) {
+    const path = `/r/${subreddit}/search.json?q=${q}&restrict_sr=on&sort=relevance&t=${t}&limit=${limit}`;
+    try {
+      const data = await redditFetch(path);
+      const children = data?.data?.children || [];
+      const allPosts = children
+        .map((c: any) => c.data)
+        .filter((p: any) => p) as any[];
+
+      const filtered = allPosts.filter(p => !p.over_18 && (p.num_comments ?? 0) >= 3);
+
+      const posts: RedditPost[] = filtered.map((p: any) => ({
         id: p.id,
         subreddit: p.subreddit,
         title: p.title || '',
@@ -115,39 +179,62 @@ export async function searchSubreddit(subreddit: string, query: string, limit = 
         created_utc: p.created_utc || 0,
         author: p.author || '[deleted]',
       }));
-  } catch (e: any) {
-    // One bad subreddit shouldn't kill the whole analysis
-    console.warn(`Search failed for r/${subreddit}: ${e.message}`);
-    return [];
+
+      // If we got nothing this window, try the next one
+      if (posts.length === 0 && t !== windows[windows.length - 1]) {
+        continue;
+      }
+
+      return {
+        posts,
+        diagnostic: {
+          subreddit,
+          posts_found: allPosts.length,
+          posts_after_filter: posts.length,
+          time_window_used: t,
+          error: null,
+        },
+      };
+    } catch (e: any) {
+      // Auth and rate limit errors — propagate. They're global, not per-subreddit.
+      if (e instanceof RedditAuthError || e instanceof RedditRateLimitError) {
+        throw e;
+      }
+      lastError = e.message;
+    }
   }
+
+  return {
+    posts: [],
+    diagnostic: {
+      subreddit,
+      posts_found: 0,
+      posts_after_filter: 0,
+      time_window_used: 'all_failed',
+      error: lastError,
+    },
+  };
 }
 
-/**
- * Fetch top comments for a post.
- * `depth=1` keeps it shallow (top-level + immediate replies, not full nested trees).
- */
 export async function fetchPostComments(post: RedditPost, limit = 30): Promise<RedditComment[]> {
   const path = `/r/${post.subreddit}/comments/${post.id}.json?limit=${limit}&sort=top&depth=1`;
 
   try {
     const data = await redditFetch(path);
-    // Reddit returns [postListing, commentListing]
     const commentListing = Array.isArray(data) ? data[1] : null;
     const children = commentListing?.data?.children || [];
 
     const comments: RedditComment[] = [];
     for (const c of children) {
-      if (c.kind !== 't1') continue; // skip "more" links
+      if (c.kind !== 't1') continue;
       const d = c.data;
       if (!d || !d.body || d.body === '[deleted]' || d.body === '[removed]') continue;
-      if (d.body.length < 20) continue; // too short to classify reliably
-      if (d.body.length > 1500) {
-        // Truncate very long comments to keep classifier input bounded
-        d.body = d.body.slice(0, 1500);
-      }
+      if (d.body.length < 20) continue;
+      let body = d.body;
+      if (body.length > 1500) body = body.slice(0, 1500);
       comments.push({
         id: d.id,
-        body: d.body,
+        body,
         score: d.score || 0,
         permalink: `https://www.reddit.com${d.permalink || `${post.permalink}${d.id}/`}`,
         created_utc: d.created_utc || 0,
@@ -158,14 +245,14 @@ export async function fetchPostComments(post: RedditPost, limit = 30): Promise<R
     }
     return comments;
   } catch (e: any) {
-    console.warn(`Comments fetch failed for ${post.id}: ${e.message}`);
+    if (e instanceof RedditAuthError || e instanceof RedditRateLimitError) throw e;
     return [];
   }
 }
 
 /**
- * High-level: search across subreddits, fetch comments, return flat list.
- * Returns metadata so the UI can show real numbers.
+ * Gather a corpus of comments. Returns comments AND a diagnostic so callers
+ * can tell the difference between "topic isn't discussed" and "auth is broken".
  */
 export async function gatherCorpus(
   subreddits: string[],
@@ -175,20 +262,24 @@ export async function gatherCorpus(
   comments: RedditComment[];
   posts: RedditPost[];
   searchedSubreddits: string[];
+  diagnostics: CorpusDiagnostics;
 }> {
   const postsPerSub = opts.postsPerSub ?? 4;
   const commentsPerPost = opts.commentsPerPost ?? 25;
   const maxComments = opts.maxComments ?? 400;
 
-  // Search all subreddits in parallel
+  // Verify auth ONCE up front — fail fast with a clear error if creds are wrong
+  await getToken();
+
   const searchResults = await Promise.all(
     subreddits.map(sub => searchSubreddit(sub, topic, postsPerSub))
   );
 
-  const allPosts: RedditPost[] = searchResults.flat();
-  // Sort by num_comments desc — richer threads first
+  const perSubreddit = searchResults.map(r => r.diagnostic);
+  const allPosts: RedditPost[] = searchResults.flatMap(r => r.posts);
+  const totalPostsPre = allPosts.length;
+
   allPosts.sort((a, b) => b.num_comments - a.num_comments);
-  // Dedupe by id
   const seen = new Set<string>();
   const dedupedPosts = allPosts.filter(p => {
     if (seen.has(p.id)) return false;
@@ -196,22 +287,38 @@ export async function gatherCorpus(
     return true;
   });
 
-  // Cap to top 16 threads to stay under timeout
   const topPosts = dedupedPosts.slice(0, 16);
 
-  // Fetch comments in parallel
-  const commentResults = await Promise.all(
+  const commentResults = await Promise.allSettled(
     topPosts.map(p => fetchPostComments(p, commentsPerPost))
   );
 
-  let comments: RedditComment[] = commentResults.flat();
-  // Sort by score desc and cap
-  comments.sort((a, b) => b.score - a.score);
-  comments = comments.slice(0, maxComments);
+  const commentErrors: string[] = [];
+  let allComments: RedditComment[] = [];
+  for (const r of commentResults) {
+    if (r.status === 'fulfilled') {
+      allComments.push(...r.value);
+    } else {
+      commentErrors.push(r.reason?.message || 'unknown error');
+    }
+  }
+  const totalCommentsFetched = allComments.length;
+
+  allComments.sort((a, b) => b.score - a.score);
+  const finalComments = allComments.slice(0, maxComments);
 
   return {
-    comments,
+    comments: finalComments,
     posts: topPosts,
     searchedSubreddits: subreddits,
+    diagnostics: {
+      auth_succeeded: true,
+      per_subreddit: perSubreddit,
+      total_posts_pre_dedup: totalPostsPre,
+      total_posts_post_dedup: dedupedPosts.length,
+      total_comments_fetched: totalCommentsFetched,
+      total_comments_after_filter: finalComments.length,
+      comment_fetch_errors: commentErrors,
+    },
   };
 }

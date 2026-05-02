@@ -1,5 +1,5 @@
 // POST /api/analyze
-// Orchestrates the four sources in parallel, blends sentiment, surfaces divergence.
+// v3.1: surfaces fatal errors (auth, rate limit) and per-source diagnostics.
 
 import { NextRequest, NextResponse } from 'next/server';
 import { findCountry } from '@/lib/countries';
@@ -30,8 +30,6 @@ export async function POST(req: NextRequest) {
     }
     const topicTrimmed = topic.trim();
 
-    // 🔥 ALL FOUR SOURCES IN PARALLEL
-    // Use Promise.allSettled so one failing source doesn't kill the whole thing.
     const tFetch = Date.now();
     const [redditR, gdeltR, wikiR, polyR] = await Promise.allSettled([
       fetchReddit(country, topicTrimmed),
@@ -46,13 +44,37 @@ export async function POST(req: NextRequest) {
     const wiki = wikiR.status === 'fulfilled' ? wikiR.value : null;
     const poly = polyR.status === 'fulfilled' ? polyR.value : null;
 
-    if ((!reddit || !reddit.found) && (!gdelt || !gdelt.found)) {
+    // Detect fatal errors that mean the result would be misleading if we proceed
+    const fatalErrors: string[] = [];
+    if (reddit?.fatal_error) fatalErrors.push(`Reddit: ${reddit.fatal_error}`);
+    if (redditR.status === 'rejected') fatalErrors.push(`Reddit: ${redditR.reason?.message || 'unknown rejection'}`);
+
+    // If Reddit completely failed AND GDELT didn't find anything either, surface details
+    const redditNoData = !reddit?.found;
+    const gdeltNoData = !gdelt?.found;
+
+    if (fatalErrors.length > 0 && redditNoData && gdeltNoData) {
+      return NextResponse.json({
+        error: 'CONFIGURATION_ERROR',
+        message: fatalErrors.join(' • '),
+        fatal_errors: fatalErrors,
+        diagnostics: {
+          reddit: reddit?.diagnostics ?? null,
+          gdelt: gdelt?.diagnostic ?? null,
+          wiki_found: wiki?.found ?? false,
+          polymarket_found: poly?.found ?? false,
+        },
+      }, { status: 200 });
+    }
+
+    if (redditNoData && gdeltNoData) {
+      // Both empty but no fatal — actually no data
       return NextResponse.json({
         error: 'INSUFFICIENT_DATA',
         message: `Couldn't find enough data for "${topicTrimmed}" in ${country.name}. Try a broader topic or more globally-discussed framing.`,
-        debug: {
-          reddit_comments: reddit?.sample_size ?? 0,
-          gdelt_articles: gdelt?.article_count ?? 0,
+        diagnostics: {
+          reddit: reddit?.diagnostics ?? null,
+          gdelt: gdelt?.diagnostic ?? null,
           wiki_found: wiki?.found ?? false,
           polymarket_found: poly?.found ?? false,
         },
@@ -61,19 +83,14 @@ export async function POST(req: NextRequest) {
 
     const blended = blend({
       reddit: reddit?.found ? {
-        found: true,
-        pulse_score: reddit.pulse_score,
-        sample_size: reddit.sample_size,
+        found: true, pulse_score: reddit.pulse_score, sample_size: reddit.sample_size,
         ci_width: reddit.pulse_score_high - reddit.pulse_score_low,
       } : null,
       gdelt: gdelt?.found ? {
-        found: true,
-        pulse_score: gdelt.pulse_score,
-        article_count: gdelt.article_count,
+        found: true, pulse_score: gdelt.pulse_score, article_count: gdelt.article_count,
       } : null,
     });
 
-    // Themes: only run if Reddit was the dominant source (richest text)
     const tThemes = Date.now();
     let themeData: any = { themes: [], surprise_finding: '', headline_verdict: '', summary: '' };
     if (reddit && reddit.found && reddit.classified.length >= 30) {
@@ -83,7 +100,7 @@ export async function POST(req: NextRequest) {
         console.warn('Theme extraction failed:', e.message);
       }
     } else if (gdelt?.found && gdelt.articles.length > 0) {
-      themeData.summary = `${gdelt.article_count} news articles tracked. Mean tone ${gdelt.mean_tone.toFixed(1)} (range -10 to +10). ${gdelt.positive_pct}% positive coverage, ${gdelt.negative_pct}% negative.`;
+      themeData.summary = `${gdelt.article_count} news articles tracked${gdelt.is_global_coverage ? ' (global, country filter dropped)' : ''}. Mean tone ${gdelt.mean_tone.toFixed(1)} (range -10 to +10). ${gdelt.positive_pct}% positive, ${gdelt.negative_pct}% negative.`;
       themeData.headline_verdict = gdelt.pulse_score >= 60 ? 'News coverage skews positive' :
                                     gdelt.pulse_score <= 40 ? 'News coverage skews negative' :
                                     'News coverage is mixed';
@@ -129,7 +146,8 @@ export async function POST(req: NextRequest) {
           subreddits_searched: reddit.subreddits_searched,
           voices: reddit.voices,
           threads: reddit.threads,
-        } : { found: false, sample_size: reddit?.sample_size ?? 0 },
+          diagnostics: reddit.diagnostics,
+        } : { found: false, sample_size: reddit?.sample_size ?? 0, diagnostics: reddit?.diagnostics, fatal_error: reddit?.fatal_error },
 
         gdelt: gdelt?.found ? {
           found: true,
@@ -143,7 +161,9 @@ export async function POST(req: NextRequest) {
           oldest_seendate: gdelt.oldest_seendate,
           newest_seendate: gdelt.newest_seendate,
           query_used: gdelt.query_used,
-        } : { found: false },
+          is_global_coverage: gdelt.is_global_coverage,
+          diagnostic: gdelt.diagnostic,
+        } : { found: false, diagnostic: gdelt?.diagnostic },
 
         wikipedia: wiki?.found ? {
           found: true,
@@ -168,7 +188,6 @@ export async function POST(req: NextRequest) {
       },
 
       confidence,
-
       themes: themeData.themes,
       surprise_finding: themeData.surprise_finding,
       headline_verdict: themeData.headline_verdict,
@@ -176,18 +195,14 @@ export async function POST(req: NextRequest) {
 
       methodology: {
         sentiment_model: SENTIMENT_MODEL_NAME,
-        formula: 'pulse-v3.0: weighted blend of Reddit + GDELT pulse scores. Polymarket and Wikipedia surfaced as separate signals.',
-        timing_ms: {
-          parallel_fetch: fetchMs,
-          themes: themesMs,
-          total: Date.now() - t0,
-        },
+        formula: 'pulse-v3.1: weighted blend of Reddit + GDELT pulse scores. Polymarket and Wikipedia surfaced as separate signals.',
+        timing_ms: { parallel_fetch: fetchMs, themes: themesMs, total: Date.now() - t0 },
       },
     });
   } catch (e: any) {
     console.error('Analyze error:', e);
     return NextResponse.json(
-      { error: 'ANALYSIS_FAILED', message: e.message || 'Unknown error' },
+      { error: 'ANALYSIS_FAILED', message: e.message || 'Unknown error', stack: e.stack?.slice(0, 500) },
       { status: 500 }
     );
   }

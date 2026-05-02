@@ -1,16 +1,9 @@
-// GDELT 2.0 DOC API — news media tone for a topic, optionally filtered by source country.
-// Free, no auth, real-time. Docs: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/
-//
-// What we use:
-//   - mode=tonechart  → histogram of articles binned by tone score [-100, +100]
-//   - mode=artlist    → up to 75 article URLs/titles for source citation
-// Tone score interpretation: GDELT scores articles using its own tone analysis;
-// in practice most scores fall in [-10, +10]. We normalize to a 0-100 Pulse-compatible scale.
+// GDELT 2.0 DOC API — v3.1 with country-filter fallback.
+// If sourcecountry: returns nothing, retry without the filter and flag the result
+// as "global coverage, not country-specific." Better than zero.
 
 const GDELT_BASE = 'https://api.gdeltproject.org/api/v2/doc/doc';
 
-// Subset of GDELT's source-country codes. They use FIPS 10-4 country codes.
-// Mapped from our Country.code (ISO 3166-1 alpha-2). Some don't match — we drop the filter for those.
 const ISO_TO_GDELT: Record<string, string> = {
   IN: 'IN', US: 'US', GB: 'UK', CA: 'CA', AU: 'AS', DE: 'GM', FR: 'FR',
   BR: 'BR', JP: 'JA', KR: 'KS', MX: 'MX', IT: 'IT', ES: 'SP', NL: 'NL',
@@ -27,31 +20,44 @@ export interface GdeltArticle {
   sourcecountry: string;
 }
 
+export interface GdeltDiagnostic {
+  country_filter_attempted: string | null;
+  country_filter_articles: number;
+  fallback_used: boolean;
+  query_string: string;
+  http_status: number | null;
+  raw_error: string | null;
+}
+
 export interface GdeltResult {
   found: boolean;
-  // Tone histogram → mean tone weighted by article count
-  mean_tone: number;          // typically -10 to +10
-  pulse_score: number;        // 0-100 normalized
-  article_count: number;      // total articles matching
-  positive_pct: number;       // % articles with tone > +1
-  neutral_pct: number;        // % with tone in [-1, +1]
-  negative_pct: number;       // % with tone < -1
-  articles: GdeltArticle[];   // sample for sources display
+  is_global_coverage: boolean; // true if we fell back to dropping the country filter
+  mean_tone: number;
+  pulse_score: number;
+  article_count: number;
+  positive_pct: number;
+  neutral_pct: number;
+  negative_pct: number;
+  articles: GdeltArticle[];
   oldest_seendate: string;
   newest_seendate: string;
   query_used: string;
+  diagnostic: GdeltDiagnostic;
 }
 
-/**
- * Convert GDELT mean tone (typically [-10, +10]) to Pulse 0-100 scale.
- * Linear: -10 → 0, 0 → 50, +10 → 100. Clamped beyond.
- */
 function toneToPulse(meanTone: number): number {
   const clamped = Math.max(-10, Math.min(10, meanTone));
   return Math.round(50 + clamped * 5);
 }
 
-async function gdeltFetch(query: string, mode: string, extraParams: Record<string, string> = {}): Promise<any> {
+interface GdeltFetchResult {
+  ok: boolean;
+  status: number;
+  data: any | null;
+  error: string | null;
+}
+
+async function gdeltFetch(query: string, mode: string, extraParams: Record<string, string> = {}): Promise<GdeltFetchResult> {
   const params = new URLSearchParams({
     query,
     mode,
@@ -60,92 +66,118 @@ async function gdeltFetch(query: string, mode: string, extraParams: Record<strin
     ...extraParams,
   });
   const url = `${GDELT_BASE}?${params.toString()}`;
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'pulse-sentiment/3.0' },
-  });
-  if (!res.ok) {
-    throw new Error(`GDELT ${mode} failed: ${res.status}`);
-  }
-  // GDELT sometimes returns an empty body for queries with no matches
-  const text = await res.text();
-  if (!text || text.trim() === '') return null;
+
   try {
-    return JSON.parse(text);
-  } catch (e) {
-    // GDELT occasionally returns HTML error pages instead of JSON
-    return null;
+    const res = await fetch(url, { headers: { 'User-Agent': 'pulse-sentiment/3.1' } });
+    const text = await res.text();
+    if (!res.ok) {
+      return { ok: false, status: res.status, data: null, error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
+    }
+    if (!text || text.trim() === '') {
+      return { ok: true, status: res.status, data: null, error: 'empty response body' };
+    }
+    try {
+      return { ok: true, status: res.status, data: JSON.parse(text), error: null };
+    } catch (e: any) {
+      return { ok: false, status: res.status, data: null, error: `JSON parse failed: ${text.slice(0, 200)}` };
+    }
+  } catch (e: any) {
+    return { ok: false, status: 0, data: null, error: e.message };
   }
 }
 
-/**
- * Run a GDELT analysis for a topic + country.
- * Returns null if not enough data is available — caller decides whether to drop this source.
- */
-export async function fetchGdelt(topic: string, isoCountry: string): Promise<GdeltResult | null> {
-  // Build query: keyword + optional source country filter
-  const gdeltCountry = ISO_TO_GDELT[isoCountry];
-  const baseQuery = `"${topic}"`;
-  const query = gdeltCountry ? `${baseQuery} sourcecountry:${gdeltCountry}` : baseQuery;
+function parseTonechart(data: any): { totalArticles: number; meanTone: number; pos: number; neu: number; neg: number } | null {
+  if (!data || !data.tonechart || !Array.isArray(data.tonechart)) return null;
+  const bins: Array<{ bin: number; count: number }> = data.tonechart;
+  if (bins.length === 0) return null;
 
-  try {
-    // 1. Tonechart for histogram → mean tone
-    const tonechart = await gdeltFetch(query, 'tonechart');
-    // Articles list (capped to 75 by GDELT)
-    const artlist = await gdeltFetch(query, 'artlist', { maxrecords: '75', sort: 'datedesc' });
-
-    if (!tonechart || !tonechart.tonechart || !Array.isArray(tonechart.tonechart)) {
-      return null;
-    }
-
-    const bins: Array<{ bin: number; count: number; toparts?: any[] }> = tonechart.tonechart;
-    if (bins.length === 0) return null;
-
-    let totalArticles = 0;
-    let weightedToneSum = 0;
-    let pos = 0, neu = 0, neg = 0;
-
-    for (const b of bins) {
-      totalArticles += b.count;
-      weightedToneSum += b.bin * b.count;
-      if (b.bin > 1) pos += b.count;
-      else if (b.bin < -1) neg += b.count;
-      else neu += b.count;
-    }
-
-    if (totalArticles < 5) {
-      // Too thin — drop this source for this query
-      return null;
-    }
-
-    const meanTone = weightedToneSum / totalArticles;
-    const pulseScore = toneToPulse(meanTone);
-
-    const articles: GdeltArticle[] = (artlist?.articles || []).slice(0, 12).map((a: any) => ({
-      url: a.url || '',
-      title: a.title || '',
-      domain: a.domain || '',
-      language: a.language || '',
-      seendate: a.seendate || '',
-      sourcecountry: a.sourcecountry || '',
-    }));
-
-    const dates = articles.map(a => a.seendate).filter(Boolean).sort();
-
-    return {
-      found: true,
-      mean_tone: Number(meanTone.toFixed(2)),
-      pulse_score: pulseScore,
-      article_count: totalArticles,
-      positive_pct: Math.round(100 * pos / totalArticles),
-      neutral_pct: Math.round(100 * neu / totalArticles),
-      negative_pct: Math.round(100 * neg / totalArticles),
-      articles,
-      oldest_seendate: dates[0] || '',
-      newest_seendate: dates[dates.length - 1] || '',
-      query_used: query,
-    };
-  } catch (e: any) {
-    console.warn(`GDELT failed: ${e.message}`);
-    return null;
+  let total = 0, weighted = 0, pos = 0, neu = 0, neg = 0;
+  for (const b of bins) {
+    total += b.count;
+    weighted += b.bin * b.count;
+    if (b.bin > 1) pos += b.count;
+    else if (b.bin < -1) neg += b.count;
+    else neu += b.count;
   }
+  if (total === 0) return null;
+  return { totalArticles: total, meanTone: weighted / total, pos, neu, neg };
+}
+
+export async function fetchGdelt(topic: string, isoCountry: string): Promise<GdeltResult> {
+  const gdeltCountry = ISO_TO_GDELT[isoCountry] || null;
+  const baseQuery = `"${topic}"`;
+  const countryQuery = gdeltCountry ? `${baseQuery} sourcecountry:${gdeltCountry}` : baseQuery;
+
+  const diagnostic: GdeltDiagnostic = {
+    country_filter_attempted: gdeltCountry,
+    country_filter_articles: 0,
+    fallback_used: false,
+    query_string: countryQuery,
+    http_status: null,
+    raw_error: null,
+  };
+
+  // Try country-filtered first
+  let queryToUse = countryQuery;
+  let isGlobal = false;
+
+  let toneRes = await gdeltFetch(queryToUse, 'tonechart');
+  diagnostic.http_status = toneRes.status;
+  diagnostic.raw_error = toneRes.error;
+
+  let parsed = parseTonechart(toneRes.data);
+  diagnostic.country_filter_articles = parsed?.totalArticles ?? 0;
+
+  // Fallback: if country filter returned <5 articles, drop the filter
+  if ((!parsed || parsed.totalArticles < 5) && gdeltCountry) {
+    queryToUse = baseQuery;
+    isGlobal = true;
+    diagnostic.fallback_used = true;
+    diagnostic.query_string = baseQuery;
+
+    toneRes = await gdeltFetch(queryToUse, 'tonechart');
+    diagnostic.http_status = toneRes.status;
+    diagnostic.raw_error = toneRes.error;
+    parsed = parseTonechart(toneRes.data);
+  }
+
+  if (!parsed || parsed.totalArticles < 5) {
+    return {
+      found: false,
+      is_global_coverage: isGlobal,
+      mean_tone: 0, pulse_score: 50, article_count: parsed?.totalArticles ?? 0,
+      positive_pct: 0, neutral_pct: 0, negative_pct: 0,
+      articles: [],
+      oldest_seendate: '', newest_seendate: '',
+      query_used: queryToUse,
+      diagnostic,
+    };
+  }
+
+  const artRes = await gdeltFetch(queryToUse, 'artlist', { maxrecords: '75', sort: 'datedesc' });
+  const articles: GdeltArticle[] = (artRes.data?.articles || []).slice(0, 12).map((a: any) => ({
+    url: a.url || '',
+    title: a.title || '',
+    domain: a.domain || '',
+    language: a.language || '',
+    seendate: a.seendate || '',
+    sourcecountry: a.sourcecountry || '',
+  }));
+  const dates = articles.map(a => a.seendate).filter(Boolean).sort();
+
+  return {
+    found: true,
+    is_global_coverage: isGlobal,
+    mean_tone: Number(parsed.meanTone.toFixed(2)),
+    pulse_score: toneToPulse(parsed.meanTone),
+    article_count: parsed.totalArticles,
+    positive_pct: Math.round(100 * parsed.pos / parsed.totalArticles),
+    neutral_pct: Math.round(100 * parsed.neu / parsed.totalArticles),
+    negative_pct: Math.round(100 * parsed.neg / parsed.totalArticles),
+    articles,
+    oldest_seendate: dates[0] || '',
+    newest_seendate: dates[dates.length - 1] || '',
+    query_used: queryToUse,
+    diagnostic,
+  };
 }
